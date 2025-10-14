@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
-from app.api.routes import chat
+from app.api.routes import chat, websocket
 
 settings = get_settings()
 
@@ -21,6 +21,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(chat.router, prefix=f"{settings.API_V1_STR}", tags=["chat"])
+app.include_router(websocket.router, prefix=f"{settings.API_V1_STR}", tags=["websocket"])
 
 
 @app.get("/")

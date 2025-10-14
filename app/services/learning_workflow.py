@@ -3,6 +3,7 @@ LangGraph workflow for managing the learning progression.
 """
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.config import get_stream_writer
 from langchain.chat_models import init_chat_model
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -255,114 +256,161 @@ class LearningWorkflow:
     # ========== WORKFLOW NODES ==========
 
     def introduction_node(self, state: LearningState) -> LearningState:
-            """
-            Introduction node - Meemo introduces itself, then collects user info.
+        """
+        Introduction node - Meemo introduces itself, then collects user info.
 
-            Flow:
-            1. Meemo introduces itself (automatic greeting)
-            2. Ask for user's name via interrupt
-            3. Ask for learning goal via interrupt
-            4. Proceed with personalized welcome
+        Flow:
+        1. Meemo introduces itself AND asks for name in one message
+        2. Wait for name via interrupt
+        3. Ask for learning goal via interrupt
+        4. Proceed with personalized welcome
 
-            Raises:
-                Exception: If introduction generation fails
-            """
-            logger.info("Processing introduction node")
+        Raises:
+            Exception: If introduction generation fails
+        """
+        logger.info("Processing introduction node")
 
-            # Step 1: Meemo's introduction (first time only)
-            # Check if we've already introduced Meemo (slides will be empty on first run)
-            if len(state.get("slides", [])) == 0:
-                logger.info("Meemo introducing itself")
+        # Step 1: AI-generated introduction with name request (first time only)
+        if len(state.get("slides", [])) == 0:
+            logger.info("Generating Meemo's introduction with AI")
 
-                meemo_intro = f"""Hi there! 👋 I'm Meemo, your friendly AI learning companion!
-        I'm here to guide you through an exciting journey into {settings.COURSE_TOPIC}.
-        I'll be using visual slides, interactive examples, and assessments to help you master this topic. You can ask me questions anytime -
-        I'm here to make learning fun and effective!
-        Before we start, I'd love to get to know you better..."""
+            # Get the user's initial greeting
+            user_greeting = state["messages"][-1].content if state["messages"] else "Hello"
 
-                intro_message = AIMessage(content=meemo_intro)
-                state["messages"].append(intro_message)
+            system_prompt = f"""You are Meemo, a friendly and enthusiastic AI learning companion. 
+                A student just greeted you with: "{user_greeting}"
 
-                # Create welcome slide
-                welcome_slide = {
-                    "slide_number": 0,
-                    "title": "Meet Meemo!",
-                    "content": meemo_intro,
-                    "visual_description": "Friendly robot character waving hello",
-                    "full_content": meemo_intro,
-                    "topic": "Introduction"
-                }
-                state["slides"].append(welcome_slide)
-                state["current_slide_index"] = 0
+                Respond naturally to their greeting, then introduce yourself warmly:
+                1. Acknowledge their greeting naturally
+                2. Introduce yourself as Meemo, their AI learning companion for {settings.COURSE_TOPIC}
+                3. Briefly explain what you'll do together (visual slides, examples, assessments, Q&A)
+                4. Express enthusiasm about teaching them
+                5. End by asking for their name in a friendly way
 
-                logger.info("Meemo's introduction added to state")
+                Be conversational, warm, and enthusiastic. Match their energy - if they're formal, be professional; if casual, be friendly!
+                Keep it to 3-4 sentences max before asking their name."""
 
-            # Step 2: Collect user name (interrupt will pause execution)
-            if not state.get("user_name"):
-                logger.info("Requesting user name via interrupt")
-                # On first call: interrupt() pauses and returns None
-                # On resume: interrupt() returns the value from Command(resume=value)
-                user_name = interrupt("What's your name? 😊")
-                state["user_name"] = user_name.strip() if user_name else None
+            intro_response = self.model.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_greeting)
+            ])
+
+            intro_message = intro_response
+            state["messages"].append(intro_message)
+
+            # Create welcome slide with AI-generated content
+            welcome_slide = {
+                "slide_number": 0,
+                "title": "Meet Meemo!",
+                "content": intro_response.content,
+                "visual_description": "Friendly robot character waving hello",
+                "full_content": intro_response.content,
+                "topic": "Introduction"
+            }
+            state["slides"].append(welcome_slide)
+            state["current_slide_index"] = 0
+
+            logger.info("Meemo's introduction added to state")
+
+        # Step 2: Collect user name (interrupt will pause execution)
+        if not state.get("user_name"):
+            logger.info("Requesting user name via interrupt")
+            
+            # CRITICAL FIX: The interrupt value should be what the user sees
+            # Don't pass the AI message content as the interrupt - it's already in messages
+            # Pass a clear instruction for what we're waiting for
+            user_name = interrupt("Waiting for user's name")
+            
+            if user_name:
+                state["user_name"] = user_name.strip()
                 logger.info(f"User name received: {state['user_name']}")
+            else:
+                # If no name provided, use default
+                state["user_name"] = "Student"
+                logger.warning("No name provided, using default")
 
-            # Step 3: Ask for learning goal (optional)
-            if not state.get("learning_goal"):
-                logger.info("Requesting learning goal via interrupt")
-                learning_goal_prompt = f"What brings you here today? What's your goal for learning about {settings.COURSE_TOPIC}? (You can skip this if you'd like)"
-                # On first call: interrupt() pauses and returns None
-                # On resume: interrupt() returns the value from Command(resume=value)
-                learning_goal = interrupt(learning_goal_prompt)
-                state["learning_goal"] = learning_goal.strip() if learning_goal and learning_goal.strip() else None
-                logger.info(f"Learning goal set: {state['learning_goal']}")
+            # After receiving name, AI generates personalized acknowledgment and goal question
+            user_name_display = state["user_name"] or "Student"
+            
+            system_prompt = f"""You are Meemo. You just learned that the student's name is {user_name_display}.
 
-            # Step 4: Personalized welcome after collecting info
-            try:
-                user_name = state.get("user_name", "Student")
-                learning_goal = state.get("learning_goal")
+                Respond warmly:
+                1. Express excitement about meeting them by name
+                2. Ask about their learning goal for {settings.COURSE_TOPIC}
+                3. Mention they can skip this question if they want to dive right in
 
-                system_prompt = f"""You are Meemo, a friendly and enthusiastic AI learning companion. You've just met {user_name}.
+                Be brief (2-3 sentences), enthusiastic, and use their name naturally."""
 
-        Give {user_name} a warm, personalized welcome and provide:
-        1. Express excitement to work with them by name
-        2. A brief overview of the {settings.COURSE_TOPIC} course structure
-        3. Mention that you'll start with: {self.curriculum[0] if self.curriculum else "the basics"}
-        4. {"Acknowledge their goal: " + learning_goal if learning_goal else ""}
+            goal_response = self.model.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"My name is {user_name_display}")
+            ])
 
-        Keep it warm, encouraging, and conversational. You're Meemo - be friendly and a bit geeky!
+            # Add the acknowledgment message
+            state["messages"].append(goal_response)
 
-        Course topics we'll cover: {', '.join(self.curriculum[:5])}"""
+        # Step 3: Ask for learning goal (optional)
+        if not state.get("learning_goal"):
+            logger.info("Requesting learning goal via interrupt")
+            
+            # CRITICAL FIX: Again, pass a clear instruction
+            learning_goal = interrupt("Waiting for user's learning goal")
+            
+            # Allow user to skip
+            if learning_goal and learning_goal.strip().lower() not in ["skip", "let's start", "lets start", ""]:
+                state["learning_goal"] = learning_goal.strip()
+            else:
+                state["learning_goal"] = None
+            
+            logger.info(f"Learning goal set: {state['learning_goal']}")
 
-                response = self.model.invoke([
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=f"(Meemo should welcome {user_name} and get ready to start teaching)")
-                ])
+        # Step 4: Personalized welcome after collecting info
+        try:
+            user_name = state.get("user_name", "Student")
+            learning_goal = state.get("learning_goal")
 
-                # Generate personalized welcome slide
-                slide = self._generate_slide(
-                    response.content,
-                    f"Welcome, {user_name}!",
-                    "Personalized course welcome",
-                    slide_number=1
-                )
+            system_prompt = f"""You are Meemo, a friendly and enthusiastic AI learning companion. You've just met {user_name}.
 
-                # Update state
-                state["messages"].append(response)
-                state["current_stage"] = "teaching"
-                state["current_topic"] = self.curriculum[0] if self.curriculum else "Introduction"
-                state["topics_remaining"] = self.curriculum[1:] if len(self.curriculum) > 1 else []
-                state["topics_covered"] = []
-                state["slides"].append(slide)
-                state["current_slide_index"] = 1
+                Give {user_name} a warm, personalized welcome and provide:
+                1. Express excitement to work with them by name
+                2. A brief overview of the {settings.COURSE_TOPIC} course structure
+                3. Mention that you'll start with: {self.curriculum[0] if self.curriculum else "the basics"}
+                4. {"Acknowledge their goal: " + learning_goal if learning_goal else ""}
 
-                logger.info("Introduction node completed successfully")
-                return state
+                Keep it warm, encouraging, and conversational. You're Meemo - be friendly and a bit geeky!
 
-            except Exception as e:
-                logger.error(f"Error generating welcome message: {str(e)}", exc_info=True)
-                # Return state with error message
-                state["messages"].append(AIMessage(content=f"I apologize, but I encountered an error during introduction. Please try again."))
-                raise Exception(f"Introduction node failed during welcome generation: {str(e)}")
+                Course topics we'll cover: {', '.join(self.curriculum[:5])}"""
+
+            response = self.model.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"(Meemo should welcome {user_name} and get ready to start teaching)")
+            ])
+
+            # Generate personalized welcome slide
+            slide = self._generate_slide(
+                response.content,
+                f"Welcome, {user_name}!",
+                "Personalized course welcome",
+                slide_number=1
+            )
+
+            # Update state
+            state["messages"].append(response)
+            state["current_stage"] = "teaching"
+            state["current_topic"] = self.curriculum[0] if self.curriculum else "Introduction"
+            state["topics_remaining"] = self.curriculum[1:] if len(self.curriculum) > 1 else []
+            state["topics_covered"] = []
+            state["slides"].append(slide)
+            state["current_slide_index"] = 1
+
+            logger.info("Introduction node completed successfully")
+            return state
+
+        except Exception as e:
+            logger.error(f"Error generating welcome message: {str(e)}", exc_info=True)
+            # Return state with error message
+            state["messages"].append(AIMessage(content=f"I apologize, but I encountered an error during introduction. Please try again."))
+            raise Exception(f"Introduction node failed during welcome generation: {str(e)}")
     
     def teaching_node(self, state: LearningState) -> LearningState:
         """
@@ -374,6 +422,15 @@ class LearningWorkflow:
         try:
             current_topic = state.get("current_topic", "Biology")
             logger.info(f"Processing teaching node for topic: {current_topic}")
+
+            # Get stream writer for real-time updates
+            try:
+                writer = get_stream_writer()
+            except Exception:
+                writer = None
+
+            if writer:
+                writer({"type": "status", "message": f"📚 Teaching about {current_topic}...", "stage": "teaching"})
 
             system_prompt = f"""You are teaching {current_topic} in a Cell Biology course.
 
@@ -435,6 +492,15 @@ Remember: this is for visual slides, so be descriptive about the structure and a
             current_topic = state.get("current_topic", "Biology")
             logger.info(f"Processing assessment node for topic: {current_topic}")
 
+            # Get stream writer for real-time updates
+            try:
+                writer = get_stream_writer()
+            except Exception:
+                writer = None
+
+            if writer:
+                writer({"type": "status", "message": f"📝 Preparing assessment for {current_topic}...", "stage": "assessment"})
+
             # Check if we already have an assessment question for this topic
             if state.get("current_assessment_question"):
                 logger.info("Assessment question already exists, waiting for answer")
@@ -485,6 +551,15 @@ Just ask the question - don't provide answers or hints yet."""
             assessment_question = state.get("current_assessment_question")
 
             logger.info(f"Evaluating answer for topic: {current_topic}")
+
+            # Get stream writer for real-time updates
+            try:
+                writer = get_stream_writer()
+            except Exception:
+                writer = None
+
+            if writer:
+                writer({"type": "status", "message": "🤔 Evaluating your answer...", "stage": "evaluating"})
 
             # Get the student's answer (last message)
             student_answer = state["messages"][-1].content if state["messages"] else ""
