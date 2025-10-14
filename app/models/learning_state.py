@@ -16,11 +16,15 @@ class LearningState(TypedDict):
 
     # Learning progression
     current_stage: Literal[
-        "introduction",      # Welcome and course overview
-        "teaching",          # Active teaching mode
-        "assessment",        # Check understanding
-        "question_answering", # Answer student questions
-        "completed"          # Course completed
+        "introduction",         # Welcome and course overview
+        "teaching",             # Active teaching mode
+        "assessment",           # Check understanding
+        "evaluation_complete",  # Assessment passed, ready for next topic
+        "needs_hint",           # Partial understanding, provide hint
+        "needs_retry",          # Incorrect answer, try again
+        "needs_review",         # Multiple failures, review topic
+        "question_answering",   # Answer student questions
+        "completed"             # Course completed
     ]
 
     # Course progress tracking
@@ -32,6 +36,10 @@ class LearningState(TypedDict):
     understanding_level: Literal["beginner", "intermediate", "advanced"]
     questions_asked: int        # Number of questions student asked
     assessments_passed: int     # Number of successful assessments
+
+    # Assessment tracking
+    current_assessment_question: str | None  # The current assessment question
+    assessment_attempts: int    # Number of attempts for current question
 
     # Slide management - each topic gets its own slide
     slides: list[dict]          # All slides generated for the course
