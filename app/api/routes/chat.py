@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from app.models.schemas import ChatRequest, ChatResponse, SessionInfoResponse, SlideNavigationResponse, SlideContent
+from app.models.schemas import ChatRequest, ResumeRequest, ChatResponse, SessionInfoResponse, SlideNavigationResponse, SlideContent
 from app.services.ai_teacher import get_teacher_service
 import json
 
@@ -23,6 +23,41 @@ async def chat(thread_id: str, request: ChatRequest):
         ai_message, slide, thread_id, current_stage = await teacher_service.chat(
             user_message=request.message,
             thread_id=thread_id
+        )
+
+        # Get session info for additional context
+        session_info = teacher_service.get_session_info(thread_id)
+
+        return ChatResponse(
+            message=ai_message,
+            slide=slide,
+            thread_id=thread_id,
+            current_stage=current_stage,
+            current_topic=session_info.get("current_topic"),
+            topics_covered=session_info.get("topics_covered", []),
+            current_slide_index=session_info.get("current_slide_index", 0),
+            total_slides=session_info.get("total_slides", 0)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/chat/resume/{thread_id}", response_model=ChatResponse)
+async def resume_chat(thread_id: str, request: ResumeRequest):
+    """
+    Resume a paused workflow with user's answer to an interrupt.
+
+    Args:
+        thread_id: Session/thread ID for conversation continuity
+        request: Resume request containing the user's answer
+
+    Returns AI response after processing the user's answer.
+    """
+    try:
+        teacher_service = get_teacher_service()
+        ai_message, slide, thread_id, current_stage = teacher_service.resume_with_answer(
+            thread_id=thread_id,
+            answer=request.answer
         )
 
         # Get session info for additional context
