@@ -7,18 +7,22 @@ import json
 router = APIRouter()
 
 
-@router.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+@router.post("/chat/{thread_id}", response_model=ChatResponse)
+async def chat(thread_id: str, request: ChatRequest):
     """
     Process a chat message through the learning workflow.
+
+    Args:
+        thread_id: Session/thread ID for conversation continuity
+        request: Chat request containing only the message
+
     Returns AI response with slide content and learning state.
     """
     try:
         teacher_service = get_teacher_service()
         ai_message, slide, thread_id, current_stage = await teacher_service.chat(
             user_message=request.message,
-            thread_id=request.thread_id,
-            user_name=request.user_name
+            thread_id=thread_id
         )
 
         # Get session info for additional context
@@ -76,10 +80,10 @@ async def navigate_slide(thread_id: str, direction: str):
         session_info = teacher_service.get_session_info(thread_id)
 
         slide = SlideContent(
-            title=slide_data.get("title", ""),
-            content=slide_data.get("content", ""),
+            title=slide_data.get("title") or "Learning Slide",
+            content=slide_data.get("content") or "Content unavailable",
             code_example=slide_data.get("code_example"),
-            visual_description=slide_data.get("visual_description", "")
+            visual_description=slide_data.get("visual_description") or "Illustration of the concept"
         )
 
         return SlideNavigationResponse(
@@ -91,7 +95,6 @@ async def navigate_slide(thread_id: str, direction: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.get("/slides/{thread_id}")
 async def get_all_slides(thread_id: str):
@@ -112,18 +115,22 @@ async def get_all_slides(thread_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
+@router.post("/chat/stream/{thread_id}")
+async def chat_stream(thread_id: str, request: ChatRequest):
     """
     Stream chat response (for future implementation).
+
+    Args:
+        thread_id: Session/thread ID for conversation continuity
+        request: Chat request containing only the message
+
     Currently returns the same as non-streaming.
     """
     try:
         teacher_service = get_teacher_service()
         ai_message, slide, thread_id, current_stage = await teacher_service.chat(
             user_message=request.message,
-            thread_id=request.thread_id,
-            user_name=request.user_name
+            thread_id=thread_id
         )
 
         session_info = teacher_service.get_session_info(thread_id)

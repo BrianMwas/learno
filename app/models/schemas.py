@@ -9,10 +9,8 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    """Request model for chat endpoint."""
+    """Request model for chat endpoint - just the message."""
     message: str
-    thread_id: str | None = None
-    user_name: str | None = None
 
 
 class SlideContent(BaseModel):
