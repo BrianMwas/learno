@@ -64,7 +64,7 @@ async def safe_send_json(websocket: WebSocket, data: dict, connection_id: str) -
     Returns True if sent successfully, False otherwise.
     """
     # Check connection state first
-    if not is_websocket_connected(websocket):
+    if not await is_websocket_connected(websocket):
         logger.debug(f"WebSocket not connected for {connection_id}, skipping message")
         return False
     
@@ -134,7 +134,7 @@ async def websocket_chat(websocket: WebSocket, thread_id: str):
         cleanup_old_messages(connection_id)
 
         # Main message loop
-        while is_websocket_connected(websocket):
+        while await is_websocket_connected(websocket):
             try:
                 data = await websocket.receive_text()
             except WebSocketDisconnect:
@@ -210,7 +210,7 @@ async def websocket_chat(websocket: WebSocket, thread_id: str):
         logger.info(f"Cleaned up connection: {connection_id}")
         
         # Safely close WebSocket
-        if is_websocket_connected(websocket):
+        if await is_websocket_connected(websocket):
             try:
                 await websocket.close()
             except Exception as e:
@@ -261,7 +261,7 @@ async def handle_chat_stream(
             stream_mode="values"
         ):
             # Check if connection is still alive
-            if not is_websocket_connected(websocket):
+            if not await is_websocket_connected(websocket):
                 logger.warning(f"WebSocket disconnected during streaming for {connection_id}")
                 return
             
@@ -289,7 +289,7 @@ async def handle_chat_stream(
             logger.info("Interrupt detected in final state")
 
         # Check connection before sending final response
-        if not is_websocket_connected(websocket):
+        if not await is_websocket_connected(websocket):
             logger.warning(f"WebSocket disconnected before final response for {connection_id}")
             return
 
@@ -320,7 +320,7 @@ async def handle_resume_stream(
     connection_id: str
 ):
     """Handle streaming for resume (after interrupt)."""
-    if not is_websocket_connected(websocket):
+    if not await is_websocket_connected(websocket):
         logger.warning(f"WebSocket not connected for {connection_id}, aborting resume stream")
         return
     
@@ -342,7 +342,7 @@ async def handle_resume_stream(
             stream_mode="values"
         ):
             # Check if connection is still alive
-            if not is_websocket_connected(websocket):
+            if not await  is_websocket_connected(websocket):
                 logger.warning(f"WebSocket disconnected during resume streaming for {connection_id}")
                 return
             
@@ -365,7 +365,7 @@ async def handle_resume_stream(
             has_interrupt = True
 
         # Check connection before sending final response
-        if not is_websocket_connected(websocket):
+        if not await is_websocket_connected(websocket):
             logger.warning(f"WebSocket disconnected before final response for {connection_id}")
             return
 
@@ -388,7 +388,7 @@ async def handle_resume_stream(
 
 async def send_interrupt_response(websocket: WebSocket, result: dict, thread_id: str, connection_id: str):
     """Send interrupt notification to client."""
-    if not is_websocket_connected(websocket):
+    if not await is_websocket_connected(websocket):
         return
     
     messages = result.get("messages", [])
@@ -418,7 +418,7 @@ async def send_interrupt_response(websocket: WebSocket, result: dict, thread_id:
 
 async def send_final_response(websocket: WebSocket, result: dict, thread_id: str, connection_id: str):
     """Send final response to client."""
-    if not is_websocket_connected(websocket):
+    if not await is_websocket_connected(websocket):
         return
     
     messages = result.get("messages", [])
