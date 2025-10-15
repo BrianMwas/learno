@@ -1,9 +1,8 @@
 """
-LangGraph workflow for managing the learning progression with agentic tools.
+LangGraph workflow for managing the learning progression with agentic tools and visual generation.
 """
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.config import get_stream_writer
 from langchain.chat_models import init_chat_model
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -13,16 +12,12 @@ from app.core.config import get_settings
 from app.core.course_config import get_curriculum
 from app.models.schemas import AssessmentEvaluation, ConversationAnalysis, GoalExtraction, NameExtraction
 from app.utils.error_messages import get_stage_error_message
-from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from app.services.visual_generator import get_visual_generator 
 import logging
 import json
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
-
-
-# ========== STRUCTURED OUTPUT SCHEMAS ==========
 
 
 class LearningWorkflow:
@@ -47,6 +42,7 @@ class LearningWorkflow:
 
             self.curriculum = get_curriculum(settings.COURSE_TOPIC)
             self.memory = MemorySaver()
+            self.visual_generator = get_visual_generator()  # ✨ NEW: Initialize visual generator
             self.graph = self._build_graph()
 
             logger.info("LearningWorkflow initialized successfully")
@@ -477,7 +473,7 @@ Use examples and relate to {settings.COURSE_TOPIC}.
     # ========== HELPER METHODS ==========
 
     def _generate_slide(self, content: str, title: str, context: str, slide_number: int) -> dict:
-        """Generate slide with visual description."""
+        """Generate slide with visual description and actual visual data."""
         try:
             slide_prompt = f"""Extract key points and visual description:
 Content: {content}
@@ -493,6 +489,24 @@ Return JSON: {{"key_points": ["point1", "point2"], "visual_description": "diagra
                 visual_desc = f"Illustration showing {context}"
                 key_points = []
 
+            # ✨ NEW: Generate actual visual using VisualGenerator
+            visual_result = None
+            visual_type = "none"
+            visual_data = None
+            
+            try:
+                logger.info(f"Generating visual for slide: {title}")
+                visual_result = self.visual_generator.generate_visual(
+                    description=visual_desc,
+                    topic=title,
+                    content=content
+                )
+                visual_type = visual_result.get("type", "none")
+                visual_data = visual_result.get("data")
+                logger.info(f"Visual generated: type={visual_type}")
+            except Exception as ve:
+                logger.warning(f"Visual generation failed, using fallback: {ve}")
+
             return {
                 "slide_number": slide_number,
                 "title": title or "Learning Slide",
@@ -500,7 +514,10 @@ Return JSON: {{"key_points": ["point1", "point2"], "visual_description": "diagra
                 "visual_description": visual_desc,
                 "full_content": content or "",
                 "topic": title or "Topic",
-                "key_points": key_points
+                "key_points": key_points,
+                # ✨ NEW: Visual data fields
+                "visual_type": visual_type,  # "mermaid" | "svg" | "premade" | "none"
+                "visual_data": visual_data   # Mermaid code, SVG instructions, or asset name
             }
 
         except Exception as e:
@@ -512,7 +529,9 @@ Return JSON: {{"key_points": ["point1", "point2"], "visual_description": "diagra
                 "visual_description": f"Illustration showing {context}",
                 "full_content": content or "",
                 "topic": title or "Topic",
-                "key_points": []
+                "key_points": [],
+                "visual_type": "none",
+                "visual_data": None
             }
 
     def initialize_state(self) -> LearningState:
