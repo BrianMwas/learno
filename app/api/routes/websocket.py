@@ -3,6 +3,7 @@ WebSocket route for streaming chat responses.
 """
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.services.ai_teacher import get_teacher_service
+from app.utils.error_messages import format_learner_error, get_stage_error_message
 from langgraph.types import Command
 import json
 import logging
@@ -248,9 +249,14 @@ async def handle_chat_stream(websocket: WebSocket, teacher_service, thread_id: s
 
     except Exception as e:
         logger.error(f"Error in chat stream: {str(e)}", exc_info=True)
+
+        # Send friendly error message to learner
+        friendly_message = format_learner_error(e)
+
         await websocket.send_json({
             "type": "error",
-            "message": str(e)
+            "message": friendly_message,
+            "technical_details": str(e) if logger.level <= logging.DEBUG else None
         })
 
 
@@ -375,7 +381,12 @@ async def handle_resume_stream(websocket: WebSocket, teacher_service, thread_id:
 
     except Exception as e:
         logger.error(f"Error in resume stream: {str(e)}", exc_info=True)
+
+        # Send friendly error message to learner
+        friendly_message = format_learner_error(e)
+
         await websocket.send_json({
             "type": "error",
-            "message": str(e)
+            "message": friendly_message,
+            "technical_details": str(e) if logger.level <= logging.DEBUG else None
         })
