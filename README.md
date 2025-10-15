@@ -1,6 +1,6 @@
 # AI Teacher Backend
 
-Backend API for an AI-powered teaching chatbot that generates interactive lessons with slides.
+Backend API for an AI-powered teaching chatbot that generates interactive lessons with slides. We decided to go with the topic on biology specifically Cell biology. Being able to handle this allows us to use visual generators that might not need image generators and due to the constraint if time and ai tokens this was the most viable way to handle the test. 
 
 ## Project Structure
 

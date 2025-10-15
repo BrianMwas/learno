@@ -11,9 +11,11 @@ app = FastAPI(
 )
 
 # Configure CORS
+# Note: For development, allow all origins to enable WebSocket connections
+# In production, set specific origins in .env via BACKEND_CORS_ORIGINS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.BACKEND_CORS_ORIGINS,
+    allow_origins=["*"],  # For development - update in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
