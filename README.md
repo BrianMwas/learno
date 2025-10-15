@@ -42,12 +42,36 @@ learno/
 
 ## Setup
 
-### Prerequisites
+### Quick Start with Docker (Recommended)
 
+**Prerequisites:**
+- Docker & Docker Compose
+- OpenAI API Key
+
+```bash
+# 1. Setup environment
+make setup
+
+# 2. Edit .env.docker with your OpenAI API key
+nano .env.docker
+
+# 3. Start services
+make up
+```
+
+**API available at:** http://localhost:8000
+
+📖 **Full Docker guide:** [DOCKER.md](DOCKER.md)
+
+---
+
+### Manual Setup (Without Docker)
+
+**Prerequisites:**
 - Python 3.11+
 - OpenAI API Key
 
-### Installation
+**Installation:**
 
 1. **Clone and navigate to the project**
 
@@ -147,6 +171,8 @@ Edit [app/services/ai_teacher.py](app/services/ai_teacher.py):
 - Modify `_create_system_prompt()` for different teaching style
 - Add tools to the agent for enhanced functionality
 - Customize slide extraction logic
+
+
 
 ## Testing
 
