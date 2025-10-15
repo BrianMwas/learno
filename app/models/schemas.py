@@ -13,6 +13,11 @@ class ChatRequest(BaseModel):
     message: str
 
 
+class ResumeRequest(BaseModel):
+    """Request model for resume endpoint - answer to interrupt."""
+    answer: str
+
+
 class SlideContent(BaseModel):
     """Slide content model."""
     title: str
