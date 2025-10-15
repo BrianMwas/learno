@@ -292,7 +292,9 @@ class LearningWorkflow:
                 3. Briefly explain what you'll do together (visual slides, examples, assessments, Q&A)
                 4. Express enthusiasm and ask them to say hello!
 
-                Be conversational, warm, and enthusiastic. Keep it to 3-4 sentences."""
+                Be conversational, warm, and enthusiastic. Keep it to 3-4 sentences.
+
+                **IMPORTANT: Format your response in markdown. Use headings, bold, italics, lists, etc. to make it engaging.**"""
 
             intro_response = self.model.invoke([
                 SystemMessage(content=system_prompt),
@@ -333,7 +335,9 @@ class LearningWorkflow:
                 2. Express excitement to meet them
                 3. Ask for their name in a friendly way
 
-                Be brief (2-3 sentences) and enthusiastic."""
+                Be brief (2-3 sentences) and enthusiastic.
+
+                **IMPORTANT: Format your response in markdown. Use bold, italics, emojis to make it friendly and engaging.**"""
 
             name_response = self.model.invoke([
                 SystemMessage(content=system_prompt),
@@ -347,7 +351,8 @@ class LearningWorkflow:
             user_name = interrupt("Please provide your name")
             state["user_name"] = user_name.strip() if user_name else "Student"
             logger.info(f"User name received: {state['user_name']}")
-            return state
+            # Re-check has_name after interrupt
+            has_name = True
         
         # STEP 3: Name collected, ask for goal and interrupt
         if has_name and not has_goal:
@@ -360,7 +365,9 @@ class LearningWorkflow:
                 2. Ask about their learning goal for {settings.COURSE_TOPIC}
                 3. Mention they can say 'skip' if they want to dive right in
 
-                Be brief (2-3 sentences), enthusiastic, and use their name naturally."""
+                Be brief (2-3 sentences), enthusiastic, and use their name naturally.
+
+                **IMPORTANT: Format your response in markdown. Use bold, italics, emojis to make it friendly and engaging.**"""
 
             goal_response = self.model.invoke([
                 SystemMessage(content=system_prompt),
@@ -382,17 +389,18 @@ class LearningWorkflow:
             # DON'T return yet - fall through to Step 4
 
         # STEP 4: Both collected, generate final welcome and transition
-        # Re-check has_goal after potentially receiving it from interrupt
+        # Re-check BOTH from state after potentially receiving from interrupts
+        has_name_now = bool(state.get("user_name"))
         has_goal_now = state.get("learning_goal") is not None
-        logger.info(f"Step 4 check: has_name={has_name}, has_goal_now={has_goal_now}, user_name={state.get('user_name')}, goal={state.get('learning_goal')}")
+        logger.info(f"Step 4 check: has_name_now={has_name_now}, has_goal_now={has_goal_now}, user_name={state.get('user_name')}, goal={state.get('learning_goal')}")
 
-        if has_name and has_goal_now:
+        if has_name_now and has_goal_now:
             logger.info("✅ Step 4: Generating final welcome message")
             
             user_name = state.get("user_name", "Student")
             learning_goal = state.get("learning_goal")
             
-            system_prompt = f"""You are Meemo, a friendly and enthusiastic AI learning companion. 
+            system_prompt = f"""You are Meemo, a friendly and enthusiastic AI learning companion.
                 You've just met {user_name}{' who wants to ' + learning_goal if learning_goal else ''}.
 
                 Give {user_name} a warm, personalized welcome:
@@ -403,7 +411,9 @@ class LearningWorkflow:
 
                 Keep it warm, encouraging, and conversational. End with enthusiasm about starting!
 
-                Course topics we'll cover: {', '.join(self.curriculum[:5])}"""
+                Course topics we'll cover: {', '.join(self.curriculum[:5])}
+
+                **IMPORTANT: Format your response in markdown. Use headings, bold, italics, lists, emojis to make it engaging and well-structured.**"""
 
             response = self.model.invoke([
                 SystemMessage(content=system_prompt),
@@ -461,7 +471,14 @@ Explain this topic clearly with:
 4. How it relates to the cell's overall function
 
 Keep it concise (3-4 paragraphs). Use analogies when helpful.
-Remember: this is for visual slides, so be descriptive about the structure and appearance."""
+Remember: this is for visual slides, so be descriptive about the structure and appearance.
+
+**IMPORTANT: Format your response in markdown with proper structure:**
+- Use headings (##, ###) for sections
+- Use **bold** for key terms
+- Use bullet points or numbered lists
+- Use code blocks for any technical terms or formulas
+- Add emojis where appropriate to make it engaging"""
 
             # Get user message
             user_msg = state["messages"][-1].content if state["messages"] else f"Teach me about {current_topic}"
@@ -535,7 +552,9 @@ Make it:
 - Open-ended enough to assess understanding
 - Engaging and friendly
 
-Just ask the question - don't provide answers or hints yet."""
+Just ask the question - don't provide answers or hints yet.
+
+**IMPORTANT: Format your question in markdown. Use bold for emphasis and emojis to make it friendly.**"""
 
             response = self.model.invoke([
                 SystemMessage(content=system_prompt),
@@ -603,7 +622,9 @@ Be supportive and constructive. If they're close but not quite right, acknowledg
 
 Respond in this format:
 JUDGMENT: [correct/partial/incorrect]
-FEEDBACK: [Your detailed feedback here]"""
+FEEDBACK: [Your detailed feedback here]
+
+**IMPORTANT: Format the FEEDBACK section in markdown with proper structure, using bold, lists, and emojis for engagement.**"""
 
             evaluation_response = self.model.invoke([
                 SystemMessage(content=system_prompt),
@@ -683,7 +704,14 @@ FEEDBACK: [Your detailed feedback here]"""
                 3. Relate it back to what they've learned
                 4. Encourage further questions
 
-                Be patient and thorough."""
+                Be patient and thorough.
+
+                **IMPORTANT: Format your answer in markdown with proper structure:**
+                - Use headings for different aspects of the answer
+                - Use **bold** for key concepts
+                - Use bullet points or numbered lists
+                - Use code blocks if needed
+                - Add emojis to make it engaging"""
 
             user_question = state["messages"][-1].content if state["messages"] else "Can you help me understand this better?"
 
