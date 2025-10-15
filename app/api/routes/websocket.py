@@ -1,7 +1,7 @@
 """
 WebSocket route for streaming chat responses with message deduplication.
 """
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketState
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.services.ai_teacher import get_teacher_service
 from app.utils.error_messages import format_learner_error, get_stage_error_message
 from langgraph.types import Command
@@ -49,13 +49,11 @@ def cleanup_old_messages(connection_id: str, max_age_seconds: int = 300):
             active_connections[connection_id].discard(msg_id)
 
 
-def is_websocket_connected(websocket: WebSocket) -> bool:
-    """Check if WebSocket is still connected and ready to send."""
+async def is_websocket_connected(websocket: WebSocket) -> bool:
+    """Check if WebSocket is still connected by sending a ping frame."""
     try:
-        return (
-            websocket.client_state == WebSocketState.CONNECTED and
-            websocket.application_state == WebSocketState.CONNECTED
-        )
+        await websocket.send_json({"type": "ping"})
+        return True
     except Exception:
         return False
 
@@ -227,7 +225,7 @@ async def handle_chat_stream(
     connection_id: str
 ):
     """Handle streaming for regular chat messages."""
-    if not is_websocket_connected(websocket):
+    if not await is_websocket_connected(websocket):
         logger.warning(f"WebSocket not connected for {connection_id}, aborting chat stream")
         return
     
