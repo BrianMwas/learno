@@ -11,6 +11,7 @@ from app.models.learning_state import LearningState
 from langgraph.types import RetryPolicy, interrupt
 from app.core.config import get_settings
 from app.core.course_config import get_curriculum
+from app.utils.error_messages import get_stage_error_message
 import logging
 
 logger = logging.getLogger(__name__)
@@ -515,8 +516,9 @@ Remember: this is for visual slides, so be descriptive about the structure and a
 
         except Exception as e:
             logger.error(f"Error in teaching_node: {str(e)}", exc_info=True)
-            state["messages"].append(AIMessage(content=f"I apologize, but I encountered an error while teaching this topic. Please try again."))
-            raise Exception(f"Teaching node failed: {str(e)}")
+            friendly_message = get_stage_error_message("teaching")
+            state["messages"].append(AIMessage(content=friendly_message))
+            raise Exception(friendly_message)
 
     def assessment_node(self, state: LearningState) -> LearningState:
         """
@@ -572,8 +574,9 @@ Just ask the question - don't provide answers or hints yet.
 
         except Exception as e:
             logger.error(f"Error in assessment_node: {str(e)}", exc_info=True)
-            state["messages"].append(AIMessage(content="Let's continue with the next topic."))
-            raise Exception(f"Assessment node failed: {str(e)}")
+            friendly_message = get_stage_error_message("assessment")
+            state["messages"].append(AIMessage(content=friendly_message))
+            raise Exception(friendly_message)
 
     def evaluate_answer_node(self, state: LearningState) -> LearningState:
         """
@@ -670,6 +673,8 @@ FEEDBACK: [Your detailed feedback here]
             elif attempts >= 2 or judgment == "incorrect":
                 # After 2 attempts or if completely incorrect, review the topic
                 state["current_stage"] = "needs_review"
+                state["assessment_attempts"] = 0  # Reset counter to prevent infinite loop
+                state["current_assessment_question"] = None  # Clear question for fresh start
             else:
                 # First incorrect attempt - give another try
                 state["current_stage"] = "needs_retry"
@@ -682,9 +687,10 @@ FEEDBACK: [Your detailed feedback here]
 
         except Exception as e:
             logger.error(f"Error in evaluate_answer_node: {str(e)}", exc_info=True)
-            state["messages"].append(AIMessage(content="I had trouble evaluating your answer. Let's move on."))
+            friendly_message = get_stage_error_message("evaluation_complete")
+            state["messages"].append(AIMessage(content=friendly_message))
             state["current_stage"] = "evaluation_complete"
-            raise Exception(f"Evaluation node failed: {str(e)}")
+            raise Exception(friendly_message)
 
     def question_answering_node(self, state: LearningState) -> LearningState:
         """
@@ -730,8 +736,9 @@ FEEDBACK: [Your detailed feedback here]
 
         except Exception as e:
             logger.error(f"Error in question_answering_node: {str(e)}", exc_info=True)
-            state["messages"].append(AIMessage(content="I apologize, but I had trouble answering your question. Could you rephrase it?"))
-            raise Exception(f"Question answering node failed: {str(e)}")
+            friendly_message = get_stage_error_message("question_answering")
+            state["messages"].append(AIMessage(content=friendly_message))
+            raise Exception(friendly_message)
 
     # ========== HELPER FUNCTIONS ==========
 

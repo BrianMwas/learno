@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from app.models.schemas import ChatRequest, ResumeRequest, ChatResponse, SessionInfoResponse, SlideNavigationResponse, SlideContent
 from app.services.ai_teacher import get_teacher_service
+from app.utils.error_messages import format_learner_error, get_stage_error_message
 import json
 
 router = APIRouter()
@@ -39,7 +40,8 @@ async def chat(thread_id: str, request: ChatRequest):
             total_slides=session_info.get("total_slides", 0)
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        friendly_message = format_learner_error(e)
+        raise HTTPException(status_code=500, detail=friendly_message)
 
 
 @router.post("/chat/resume/{thread_id}", response_model=ChatResponse)
@@ -74,7 +76,8 @@ async def resume_chat(thread_id: str, request: ResumeRequest):
             total_slides=session_info.get("total_slides", 0)
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        friendly_message = format_learner_error(e)
+        raise HTTPException(status_code=500, detail=friendly_message)
 
 
 @router.delete("/session/{thread_id}")
@@ -103,7 +106,8 @@ async def clear_session(thread_id: str):
             "thread_id": thread_id
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        friendly_message = format_learner_error(e)
+        raise HTTPException(status_code=500, detail=friendly_message)
 
 
 @router.get("/session/{thread_id}", response_model=SessionInfoResponse)
@@ -122,7 +126,8 @@ async def get_session_info(thread_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        friendly_message = format_learner_error(e)
+        raise HTTPException(status_code=500, detail=friendly_message)
 
 
 @router.post("/slides/navigate/{thread_id}/{direction}", response_model=SlideNavigationResponse)
@@ -158,7 +163,8 @@ async def navigate_slide(thread_id: str, direction: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        friendly_message = format_learner_error(e)
+        raise HTTPException(status_code=500, detail=friendly_message)
 
 @router.get("/slides/{thread_id}")
 async def get_all_slides(thread_id: str):
@@ -176,7 +182,8 @@ async def get_all_slides(thread_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        friendly_message = format_learner_error(e)
+        raise HTTPException(status_code=500, detail=friendly_message)
 
 
 @router.post("/chat/stream/{thread_id}")
@@ -215,4 +222,5 @@ async def chat_stream(thread_id: str, request: ChatRequest):
 
         return StreamingResponse(generate(), media_type="application/json")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        friendly_message = format_learner_error(e)
+        raise HTTPException(status_code=500, detail=friendly_message)
