@@ -1,7 +1,7 @@
 """
 WebSocket route for streaming chat responses with message deduplication.
 """
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketState
 from app.services.ai_teacher import get_teacher_service
 from app.utils.error_messages import format_learner_error, get_stage_error_message
 from langgraph.types import Command
@@ -49,11 +49,27 @@ def cleanup_old_messages(connection_id: str, max_age_seconds: int = 300):
             active_connections[connection_id].discard(msg_id)
 
 
+def is_websocket_connected(websocket: WebSocket) -> bool:
+    """Check if WebSocket is still connected and ready to send."""
+    try:
+        return (
+            websocket.client_state == WebSocketState.CONNECTED and
+            websocket.application_state == WebSocketState.CONNECTED
+        )
+    except Exception:
+        return False
+
+
 async def safe_send_json(websocket: WebSocket, data: dict, connection_id: str) -> bool:
     """
     Safely send JSON with deduplication and error handling.
     Returns True if sent successfully, False otherwise.
     """
+    # Check connection state first
+    if not is_websocket_connected(websocket):
+        logger.debug(f"WebSocket not connected for {connection_id}, skipping message")
+        return False
+    
     try:
         # Add message ID if not present
         if "message_id" not in data:
@@ -74,7 +90,10 @@ async def safe_send_json(websocket: WebSocket, data: dict, connection_id: str) -
         return True
         
     except (WebSocketDisconnect, RuntimeError, ConnectionError) as e:
-        logger.warning(f"Failed to send message to {connection_id}: {str(e)}")
+        logger.debug(f"Cannot send to {connection_id}: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error sending to {connection_id}: {str(e)}")
         return False
 
 
@@ -84,8 +103,13 @@ async def websocket_chat(websocket: WebSocket, thread_id: str):
     WebSocket endpoint for streaming chat with the learning workflow.
     """
     connection_id = f"{thread_id}_{uuid.uuid4().hex[:8]}"
-    await websocket.accept()
-    logger.info(f"WebSocket connection established: {connection_id} (thread: {thread_id})")
+    
+    try:
+        await websocket.accept()
+        logger.info(f"WebSocket connection established: {connection_id} (thread: {thread_id})")
+    except Exception as e:
+        logger.error(f"Failed to accept WebSocket connection: {str(e)}")
+        return
     
     # Initialize connection tracking
     active_connections[connection_id] = set()
@@ -111,73 +135,88 @@ async def websocket_chat(websocket: WebSocket, thread_id: str):
         # Periodic cleanup
         cleanup_old_messages(connection_id)
 
-        while True:
-            data = await websocket.receive_text()
-            message_data = json.loads(data)
-            message_type = message_data.get("type")
+        # Main message loop
+        while is_websocket_connected(websocket):
+            try:
+                data = await websocket.receive_text()
+            except WebSocketDisconnect:
+                logger.info(f"Client disconnected: {connection_id}")
+                break
+            except RuntimeError as e:
+                if "not connected" in str(e).lower() or "close message" in str(e).lower():
+                    logger.info(f"WebSocket closed during receive: {connection_id}")
+                    break
+                raise
             
-            logger.info(f"Received message type '{message_type}' from {connection_id}")
+            try:
+                message_data = json.loads(data)
+                message_type = message_data.get("type")
+                
+                logger.info(f"Received message type '{message_type}' from {connection_id}")
 
-            if message_type == "message":
-                user_message = message_data.get("content")
-                if not user_message:
+                if message_type == "message":
+                    user_message = message_data.get("content")
+                    if not user_message:
+                        await safe_send_json(websocket, {
+                            "type": "error",
+                            "message": "Missing content in message"
+                        }, connection_id)
+                        continue
+
+                    await handle_chat_stream(websocket, teacher_service, thread_id, user_message, connection_id)
+
+                elif message_type == "resume":
+                    answer = message_data.get("answer")
+                    if not answer:
+                        await safe_send_json(websocket, {
+                            "type": "error",
+                            "message": "Missing answer in resume"
+                        }, connection_id)
+                        continue
+
+                    await handle_resume_stream(websocket, teacher_service, thread_id, answer, connection_id)
+
+                elif message_type == "ping":
+                    # Heartbeat response
+                    await safe_send_json(websocket, {
+                        "type": "pong",
+                        "timestamp": datetime.utcnow().isoformat()
+                    }, connection_id)
+
+                else:
                     await safe_send_json(websocket, {
                         "type": "error",
-                        "message": "Missing content in message"
+                        "message": f"Unknown message type: {message_type}"
                     }, connection_id)
-                    continue
-
-                await handle_chat_stream(websocket, teacher_service, thread_id, user_message, connection_id)
-
-            elif message_type == "resume":
-                answer = message_data.get("answer")
-                if not answer:
-                    await safe_send_json(websocket, {
-                        "type": "error",
-                        "message": "Missing answer in resume"
-                    }, connection_id)
-                    continue
-
-                await handle_resume_stream(websocket, teacher_service, thread_id, answer, connection_id)
-
-            elif message_type == "ping":
-                # Heartbeat response
-                await safe_send_json(websocket, {
-                    "type": "pong",
-                    "timestamp": datetime.utcnow().isoformat()
-                }, connection_id)
-
-            else:
+                    
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON received from {connection_id}")
                 await safe_send_json(websocket, {
                     "type": "error",
-                    "message": f"Unknown message type: {message_type}"
+                    "message": "Invalid JSON format"
                 }, connection_id)
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {connection_id}")
-    except RuntimeError as e:
-        if "close message has been sent" in str(e):
-            logger.info(f"Client already disconnected: {connection_id}")
-        else:
-            logger.error(f"WebSocket runtime error: {connection_id}: {str(e)}", exc_info=True)
     except Exception as e:
         logger.error(f"WebSocket error for {connection_id}: {str(e)}", exc_info=True)
-        try:
-            await safe_send_json(websocket, {
-                "type": "error",
-                "message": str(e)
-            }, connection_id)
-        except:
-            pass
+        # Try to send error, but don't fail if we can't
+        await safe_send_json(websocket, {
+            "type": "error",
+            "message": "An unexpected error occurred"
+        }, connection_id)
     finally:
         # Cleanup connection tracking
         active_connections.pop(connection_id, None)
         connection_metadata.pop(connection_id, None)
         logger.info(f"Cleaned up connection: {connection_id}")
-        try:
-            await websocket.close()
-        except:
-            pass
+        
+        # Safely close WebSocket
+        if is_websocket_connected(websocket):
+            try:
+                await websocket.close()
+            except Exception as e:
+                logger.debug(f"Error closing WebSocket: {str(e)}")
 
 
 async def handle_chat_stream(
@@ -188,6 +227,10 @@ async def handle_chat_stream(
     connection_id: str
 ):
     """Handle streaming for regular chat messages."""
+    if not is_websocket_connected(websocket):
+        logger.warning(f"WebSocket not connected for {connection_id}, aborting chat stream")
+        return
+    
     try:
         logger.info(f"Starting chat stream for {connection_id}")
 
@@ -219,6 +262,11 @@ async def handle_chat_stream(
             config=config,
             stream_mode="values"
         ):
+            # Check if connection is still alive
+            if not is_websocket_connected(websocket):
+                logger.warning(f"WebSocket disconnected during streaming for {connection_id}")
+                return
+            
             chunk_count += 1
             
             if "__interrupt__" in chunk:
@@ -241,6 +289,11 @@ async def handle_chat_stream(
         if not has_interrupt and result and "__interrupt__" in result:
             has_interrupt = True
             logger.info("Interrupt detected in final state")
+
+        # Check connection before sending final response
+        if not is_websocket_connected(websocket):
+            logger.warning(f"WebSocket disconnected before final response for {connection_id}")
+            return
 
         # Send appropriate response
         if has_interrupt:
@@ -269,6 +322,10 @@ async def handle_resume_stream(
     connection_id: str
 ):
     """Handle streaming for resume (after interrupt)."""
+    if not is_websocket_connected(websocket):
+        logger.warning(f"WebSocket not connected for {connection_id}, aborting resume stream")
+        return
+    
     try:
         logger.info(f"Starting resume stream for {connection_id}")
 
@@ -286,6 +343,11 @@ async def handle_resume_stream(
             config=config,
             stream_mode="values"
         ):
+            # Check if connection is still alive
+            if not is_websocket_connected(websocket):
+                logger.warning(f"WebSocket disconnected during resume streaming for {connection_id}")
+                return
+            
             if "__interrupt__" in chunk:
                 has_interrupt = True
                 final_result = chunk
@@ -303,6 +365,11 @@ async def handle_resume_stream(
 
         if not has_interrupt and result and "__interrupt__" in result:
             has_interrupt = True
+
+        # Check connection before sending final response
+        if not is_websocket_connected(websocket):
+            logger.warning(f"WebSocket disconnected before final response for {connection_id}")
+            return
 
         if has_interrupt:
             await send_interrupt_response(websocket, result, thread_id, connection_id)
@@ -323,6 +390,9 @@ async def handle_resume_stream(
 
 async def send_interrupt_response(websocket: WebSocket, result: dict, thread_id: str, connection_id: str):
     """Send interrupt notification to client."""
+    if not is_websocket_connected(websocket):
+        return
+    
     messages = result.get("messages", [])
     
     ai_message = None
@@ -350,6 +420,9 @@ async def send_interrupt_response(websocket: WebSocket, result: dict, thread_id:
 
 async def send_final_response(websocket: WebSocket, result: dict, thread_id: str, connection_id: str):
     """Send final response to client."""
+    if not is_websocket_connected(websocket):
+        return
+    
     messages = result.get("messages", [])
     ai_message = ""
     
