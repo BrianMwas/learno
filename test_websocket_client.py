@@ -1,5 +1,5 @@
 """
-Test WebSocket client for streaming chat.
+Test WebSocket client for streaming chat - Natural conversation flow.
 Run this to test the WebSocket streaming functionality.
 """
 import asyncio
@@ -8,190 +8,262 @@ import json
 
 
 async def test_websocket_chat():
-    """Test the WebSocket chat streaming."""
-    thread_id = "test_ws_session"
+    """Test the WebSocket chat streaming with natural interrupt handling."""
+    thread_id = "test_ws_natural_flow_v3"
     uri = f"ws://localhost:8000/api/v1/ws/chat/{thread_id}"
 
     print(f"\n{'='*80}")
-    print("WEBSOCKET STREAMING TEST")
+    print("WEBSOCKET STREAMING TEST - NATURAL CONVERSATION FLOW")
     print(f"{'='*80}\n")
 
     async with websockets.connect(uri) as websocket:
         print("✓ Connected to WebSocket\n")
 
-        # Step 1: Send initial message
-        print("--- Step 1: Sending 'Hello' ---")
+        # Step 0: Send initial message to trigger Meemo's greeting (no user input yet)
+        print("--- Step 0: Triggering initial greeting ---")
+        await websocket.send(json.dumps({
+            "type": "message",
+            "content": "(start)"  # Trigger initial greeting
+        }))
+
+        # Receive initial greeting (should NOT have an interrupt yet)
+        initial_greeting_received = False
+        
+        while True:
+            try:
+                response = await websocket.recv()
+                data = json.loads(response)
+                message_type = data.get("type")
+
+                print(f"  [{message_type.upper()}]", end="")
+
+                if message_type == "stream_start":
+                    print(f" {data.get('message')}")
+                
+                elif message_type == "progress":
+                    stage = data.get("stage")
+                    print(f" Stage: {stage}")
+
+                elif message_type == "response":
+                    greeting = data.get("message")
+                    print(f"\n\n👋 MEEMO'S GREETING:")
+                    print(f"   {greeting[:200]}...")
+                    initial_greeting_received = True
+
+                elif message_type == "interrupt":
+                    print(f"\n\n❌ UNEXPECTED INTERRUPT!")
+                    print("   (Should not interrupt on initial greeting)")
+                    return False
+
+                elif message_type == "stream_end":
+                    print("\n✓ Stream ended")
+                    break
+
+                elif message_type == "error":
+                    print(f"\n❌ Error: {data.get('message')}")
+                    return False
+
+            except websockets.exceptions.ConnectionClosed:
+                print("\n⚠️  Connection closed")
+                break
+
+        if not initial_greeting_received:
+            print("\n❌ FAILED: Did not receive initial greeting!")
+            return False
+        
+        print("\n✅ Initial greeting received (no interrupt - waiting for user response)")
+
+        # Step 1: User responds with "Hello" - NOW it should ask for name and interrupt
+        print("\n--- Step 1: User says 'Hello' ---")
         await websocket.send(json.dumps({
             "type": "message",
             "content": "Hello"
         }))
 
-        # Receive and display all responses
-        interrupt_received = False
+        # Should receive interrupt asking for name
+        name_interrupt_received = False
+        
         while True:
             try:
                 response = await websocket.recv()
                 data = json.loads(response)
-
                 message_type = data.get("type")
-                print(f"\n[{message_type.upper()}]", end="")
 
-                if message_type == "custom":
-                    # Custom stream event from node
-                    custom_data = data.get("data", {})
-                    print(f" {custom_data}")
+                print(f"  [{message_type.upper()}]", end="")
 
-                elif message_type == "update":
-                    # Node update
-                    update_data = data.get("data", {})
-                    print(f" Node update: {list(update_data.keys())}")
+                if message_type == "stream_start":
+                    print(f" {data.get('message')}")
+                
+                elif message_type == "progress":
+                    stage = data.get("stage")
+                    print(f" Stage: {stage}")
 
                 elif message_type == "interrupt":
-                    # Interrupt - waiting for user input
-                    message = data.get("message")
-                    print(f"\n\n🛑 INTERRUPT: {message}")
-                    interrupt_received = True
-
-                elif message_type == "response":
-                    # Final response
-                    message = data.get("message")
-                    stage = data.get("current_stage")
-                    print(f"\n\n📝 Response (stage={stage}):")
-                    print(f"Message: {message[:200]}...")
+                    interrupt_message = data.get("message")
+                    interrupt_id = data.get("interrupt_id")
+                    print(f"\n\n🛑 NAME INTERRUPT RECEIVED!")
+                    print(f"   ID: {interrupt_id}")
+                    print(f"   Message: {interrupt_message[:200]}...")
+                    name_interrupt_received = True
 
                 elif message_type == "stream_end":
-                    print("\n\n✓ Stream ended")
+                    print("\n✓ Stream ended")
                     break
 
                 elif message_type == "error":
-                    print(f"\n\n❌ Error: {data.get('message')}")
-                    break
+                    print(f"\n❌ Error: {data.get('message')}")
+                    return False
 
             except websockets.exceptions.ConnectionClosed:
-                print("\n\n⚠️  Connection closed")
+                print("\n⚠️  Connection closed")
                 break
 
-        if not interrupt_received:
-            print("\n❌ Expected interrupt but didn't receive one!")
+        if not name_interrupt_received:
+            print("\n❌ FAILED: Expected interrupt for name but didn't receive one!")
             return False
+        
+        print("\n✅ Name interrupt received correctly")
 
-        # Step 2: Resume with name
-        print("\n\n--- Step 2: Resuming with name 'Alice' ---")
+        # Step 2: Resume with name - should ask for goal and interrupt
+        print("\n--- Step 2: Providing name 'Alice' ---")
         await websocket.send(json.dumps({
             "type": "resume",
             "answer": "Alice"
         }))
 
-        # Receive and display all responses
-        second_interrupt = False
+        # Should receive interrupt asking for learning goal
+        goal_interrupt_received = False
+        
         while True:
             try:
                 response = await websocket.recv()
                 data = json.loads(response)
-
                 message_type = data.get("type")
-                print(f"\n[{message_type.upper()}]", end="")
 
-                if message_type == "custom":
-                    custom_data = data.get("data", {})
-                    print(f" {custom_data}")
+                print(f"  [{message_type.upper()}]", end="")
 
-                elif message_type == "update":
-                    update_data = data.get("data", {})
-                    print(f" Node update: {list(update_data.keys())}")
+                if message_type == "stream_start":
+                    print(f" {data.get('message')}")
+                
+                elif message_type == "progress":
+                    stage = data.get("stage")
+                    print(f" Stage: {stage}")
 
                 elif message_type == "interrupt":
-                    message = data.get("message")
-                    print(f"\n\n🛑 INTERRUPT: {message}")
-                    second_interrupt = True
-
-                elif message_type == "response":
-                    message = data.get("message")
-                    stage = data.get("current_stage")
-                    topic = data.get("current_topic")
-                    print(f"\n\n📝 Response (stage={stage}, topic={topic}):")
-                    print(f"Message: {message[:200]}...")
+                    interrupt_message = data.get("message")
+                    interrupt_id = data.get("interrupt_id")
+                    print(f"\n\n🛑 GOAL INTERRUPT RECEIVED!")
+                    print(f"   ID: {interrupt_id}")
+                    print(f"   Message: {interrupt_message[:200]}...")
+                    goal_interrupt_received = True
 
                 elif message_type == "stream_end":
-                    print("\n\n✓ Stream ended")
+                    print("\n✓ Stream ended")
                     break
 
                 elif message_type == "error":
-                    print(f"\n\n❌ Error: {data.get('message')}")
-                    break
+                    print(f"\n❌ Error: {data.get('message')}")
+                    return False
 
             except websockets.exceptions.ConnectionClosed:
-                print("\n\n⚠️  Connection closed")
+                print("\n⚠️  Connection closed")
                 break
 
-        if not second_interrupt:
-            print("\n❌ Expected second interrupt but didn't receive one!")
+        if not goal_interrupt_received:
+            print("\n❌ FAILED: Expected interrupt for learning goal but didn't receive one!")
             return False
+        
+        print("\n✅ Goal interrupt received correctly")
 
-        # Step 3: Resume with learning goal
-        print("\n\n--- Step 3: Resuming with goal 'I want to learn about cells' ---")
+        # Step 3: Resume with learning goal - should get final welcome and start teaching
+        print("\n--- Step 3: Providing goal 'I want to learn about cells' ---")
         await websocket.send(json.dumps({
             "type": "resume",
             "answer": "I want to learn about cells"
         }))
 
-        # Receive and display all responses
+        # Should receive final welcome and teaching should start
         final_response_received = False
+        final_stage = None
+        
         while True:
             try:
                 response = await websocket.recv()
                 data = json.loads(response)
-
                 message_type = data.get("type")
-                print(f"\n[{message_type.upper()}]", end="")
 
-                if message_type == "custom":
-                    custom_data = data.get("data", {})
-                    print(f" {custom_data}")
+                print(f"  [{message_type.upper()}]", end="")
 
-                elif message_type == "update":
-                    update_data = data.get("data", {})
-                    print(f" Node update: {list(update_data.keys())}")
+                if message_type == "stream_start":
+                    print(f" {data.get('message')}")
+                
+                elif message_type == "progress":
+                    stage = data.get("stage")
+                    print(f" Stage: {stage}")
 
                 elif message_type == "response":
-                    message = data.get("message")
-                    stage = data.get("current_stage")
+                    final_message = data.get("message")
+                    final_stage = data.get("current_stage")
                     topic = data.get("current_topic")
                     total_slides = data.get("total_slides")
-                    print(f"\n\n📝 Final Response:")
-                    print(f"  Stage: {stage}")
-                    print(f"  Topic: {topic}")
-                    print(f"  Total Slides: {total_slides}")
-                    print(f"  Message: {message[:200]}...")
+                    
+                    print(f"\n\n📝 FINAL WELCOME & TEACHING START!")
+                    print(f"   Stage: {final_stage}")
+                    print(f"   Topic: {topic}")
+                    print(f"   Total Slides: {total_slides}")
+                    print(f"   Message: {final_message[:150]}...")
                     final_response_received = True
 
+                elif message_type == "interrupt":
+                    print(f"\n\n❌ UNEXPECTED INTERRUPT!")
+                    print("   (Should not interrupt after goal - should start teaching)")
+                    return False
+
                 elif message_type == "stream_end":
-                    print("\n\n✓ Stream ended")
+                    print("\n✓ Stream ended")
                     break
 
                 elif message_type == "error":
-                    print(f"\n\n❌ Error: {data.get('message')}")
-                    break
+                    print(f"\n❌ Error: {data.get('message')}")
+                    return False
 
             except websockets.exceptions.ConnectionClosed:
-                print("\n\n⚠️  Connection closed")
+                print("\n⚠️  Connection closed")
                 break
 
-        if final_response_received:
-            print("\n\n🎉 SUCCESS! WebSocket streaming works with interrupts!")
-            return True
-        else:
-            print("\n\n❌ Did not receive final response")
+        if not final_response_received:
+            print("\n❌ FAILED: Did not receive final welcome response!")
             return False
+        
+        if final_stage != "teaching":
+            print(f"\n❌ FAILED: Expected stage 'teaching' but got '{final_stage}'")
+            return False
+
+        print("\n✅ Final welcome received and teaching started!")
+        
+        # Summary
+        print("\n" + "="*80)
+        print("🎉 SUCCESS! Natural conversation flow works perfectly!")
+        print("="*80)
+        print("\n📊 COMPLETE FLOW:")
+        print("   0. ✓ Connected → Meemo greeted (no interrupt)")
+        print("   1. ✓ Said 'Hello' → Meemo asked for name (INTERRUPT)")
+        print("   2. ✓ Provided 'Alice' → Meemo asked for goal (INTERRUPT)")
+        print("   3. ✓ Provided goal → Welcome message + Teaching started")
+        print("\n💡 This creates a natural back-and-forth conversation!")
+        
+        return True
 
 
 if __name__ == "__main__":
     try:
         result = asyncio.run(test_websocket_chat())
         if result:
-            print("\n✅ All tests passed!")
+            print("\n✅ ALL TESTS PASSED!")
         else:
-            print("\n❌ Some tests failed")
+            print("\n❌ TESTS FAILED")
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Test interrupted by user")
     except Exception as e:
         print(f"\n❌ Test failed with error: {e}")
         import traceback

@@ -77,6 +77,35 @@ async def resume_chat(thread_id: str, request: ResumeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.delete("/session/{thread_id}")
+async def clear_session(thread_id: str):
+    """
+    Clear/reset a learning session.
+
+    Args:
+        thread_id: The session thread ID to clear
+
+    Returns success status.
+    """
+    try:
+        teacher_service = get_teacher_service()
+
+        # Remove from sessions set
+        if thread_id in teacher_service.sessions:
+            teacher_service.sessions.remove(thread_id)
+
+        # Note: LangGraph's MemorySaver doesn't have a built-in delete method
+        # The session will restart fresh on next access since we removed it from sessions
+
+        return {
+            "status": "success",
+            "message": f"Session {thread_id} cleared",
+            "thread_id": thread_id
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/session/{thread_id}", response_model=SessionInfoResponse)
 async def get_session_info(thread_id: str):
     """

@@ -33,6 +33,19 @@ async def websocket_chat(websocket: WebSocket, thread_id: str):
     try:
         teacher_service = get_teacher_service()
 
+        # For brand new sessions, automatically send Meemo's introduction
+        if thread_id not in teacher_service.sessions:
+            logger.info("🆕 New session - triggering Meemo's automatic introduction")
+            # Check if there's any state in the checkpointer
+            config = {"configurable": {"thread_id": thread_id}}
+            existing_state = teacher_service.workflow.graph.get_state(config)
+
+            if not existing_state or not existing_state.values or len(existing_state.values.get("slides", [])) == 0:
+                logger.info("No existing slides - this is truly a fresh session")
+                # Trigger the introduction without user input
+                await handle_chat_stream(websocket, teacher_service, thread_id, "(start)")
+        
+
         while True:
             # Receive message from client
             data = await websocket.receive_text()
@@ -95,16 +108,13 @@ async def handle_chat_stream(websocket: WebSocket, teacher_service, thread_id: s
     try:
         logger.info(f"Starting chat stream for thread_id: {thread_id}")
 
-        # Send initial status
         await websocket.send_json({
             "type": "stream_start",
             "message": "Processing your message..."
         })
 
-        # Get config for checkpointer
         config = {"configurable": {"thread_id": thread_id}}
 
-        # Prepare input data
         from langchain_core.messages import HumanMessage
 
         if thread_id not in teacher_service.sessions:
@@ -119,30 +129,27 @@ async def handle_chat_stream(websocket: WebSocket, teacher_service, thread_id: s
         # Stream the graph execution
         has_interrupt = False
         final_result = None
+        chunk_count = 0
 
         try:
             logger.info("Starting stream iteration...")
-            chunk_count = 0
             
-            # CRITICAL FIX: Use stream_mode="values" only (not a list)
-            # This ensures we get the full state values including __interrupt__
             async for chunk in teacher_service.workflow.graph.astream(
                 input_data,
                 config=config,
-                stream_mode="values"  # ← KEY FIX: single mode, not list
+                stream_mode="values"
             ):
                 chunk_count += 1
                 logger.info(f"Chunk {chunk_count}: keys={list(chunk.keys()) if isinstance(chunk, dict) else 'N/A'}")
 
-                # Check for interrupt in this chunk
+                # Check for interrupt
                 if "__interrupt__" in chunk:
                     has_interrupt = True
                     final_result = chunk
                     logger.info(f"🔴 INTERRUPT DETECTED in chunk {chunk_count}")
                     logger.info(f"Interrupt data: {chunk['__interrupt__']}")
-                    # Don't break - let it finish naturally
                 else:
-                    # Send progress update to client
+                    # Send progress update
                     await websocket.send_json({
                         "type": "progress",
                         "stage": chunk.get("current_stage", "processing"),
@@ -154,7 +161,7 @@ async def handle_chat_stream(websocket: WebSocket, teacher_service, thread_id: s
             logger.error(f"Error during streaming: {str(e)}", exc_info=True)
             raise
 
-        # After streaming completes, get final state
+        # Get final state after streaming
         final_state = teacher_service.workflow.graph.get_state(config)
         result = final_state.values if final_state else final_result
 
@@ -164,29 +171,37 @@ async def handle_chat_stream(websocket: WebSocket, teacher_service, thread_id: s
             logger.info("🔴 INTERRUPT DETECTED in final state")
 
         logger.info(f"Stream complete - has_interrupt: {has_interrupt}")
-        logger.info(f"Final state keys: {list(result.keys()) if result else 'None'}")
 
         if has_interrupt:
-            # Extract interrupt information
-            interrupts = result.get("__interrupt__", [])
-            interrupt_value = interrupts[0].value if interrupts else "Please provide your information"
-
-            # CRITICAL: Get the actual AI message that was just added before the interrupt
-            # The last message in the conversation is what Meemo actually said
+            # Extract the last AI message (what Meemo actually said to the user)
             messages = result.get("messages", [])
-            ai_prompt = messages[-1].content if messages else interrupt_value
+            
+            # Find the last AI message
+            ai_message = None
+            for msg in reversed(messages):
+                if hasattr(msg, 'type') and msg.type == 'ai':
+                    ai_message = msg.content
+                    break
+            
+            if not ai_message:
+                # Fallback if no AI message found
+                ai_message = "Please provide your information"
+            
+            # Get interrupt metadata
+            interrupts = result.get("__interrupt__", [])
+            interrupt_value = interrupts[0].value if interrupts else "user_input_required"
 
             logger.info(f"Sending interrupt to client")
-            logger.info(f"Interrupt reason: {interrupt_value}")
-            logger.info(f"AI prompt: {ai_prompt[:100]}")
+            logger.info(f"AI message: {ai_message[:100]}...")
+            logger.info(f"Interrupt ID: {interrupt_value}")
 
             teacher_service.sessions.add(thread_id)
 
             # Send interrupt notification with the AI's actual message
             await websocket.send_json({
                 "type": "interrupt",
-                "message": ai_prompt,  # ← Send the AI's message, not the interrupt value
-                "interrupt_reason": interrupt_value,  # Include reason for debugging
+                "message": ai_message,  # What Meemo said
+                "interrupt_id": interrupt_value,  # Internal identifier
                 "stage": "awaiting_user_input",
                 "thread_id": thread_id,
                 "current_slide_index": result.get("current_slide_index", 0),
@@ -196,15 +211,22 @@ async def handle_chat_stream(websocket: WebSocket, teacher_service, thread_id: s
             # No interrupt - send final response
             teacher_service.sessions.add(thread_id)
 
-            ai_message = result["messages"][-1].content if result.get("messages") else ""
+            messages = result.get("messages", [])
+            ai_message = ""
+            
+            # Get last AI message
+            for msg in reversed(messages):
+                if hasattr(msg, 'type') and msg.type == 'ai':
+                    ai_message = msg.content
+                    break
+
             current_slide_index = result.get("current_slide_index", 0)
             slides = result.get("slides", [])
 
             # Get slide data
+            slide_data = None
             if slides and current_slide_index < len(slides):
                 slide_data = slides[current_slide_index]
-            else:
-                slide_data = None
 
             # Send final response
             await websocket.send_json({
@@ -237,29 +259,25 @@ async def handle_resume_stream(websocket: WebSocket, teacher_service, thread_id:
     Handle streaming for resume (after interrupt).
     """
     try:
-        logger.info(f"Starting resume stream for thread_id: {thread_id}")
+        logger.info(f"Starting resume stream for thread_id: {thread_id} with answer: {answer[:50]}")
 
-        # Send initial status
         await websocket.send_json({
             "type": "stream_start",
             "message": "Processing your answer..."
         })
 
-        # Get config for checkpointer
         config = {"configurable": {"thread_id": thread_id}}
 
         # Stream the resume
         has_interrupt = False
         final_result = None
+        chunk_count = 0
 
         try:
-            chunk_count = 0
-            
-            # CRITICAL FIX: Use astream (async) and stream_mode="values" only
             async for chunk in teacher_service.workflow.graph.astream(
                 Command(resume=answer),
                 config=config,
-                stream_mode="values"  # ← KEY FIX: single mode, not list
+                stream_mode="values"
             ):
                 chunk_count += 1
                 logger.info(f"Resume chunk {chunk_count}: keys={list(chunk.keys()) if isinstance(chunk, dict) else 'N/A'}")
@@ -268,8 +286,7 @@ async def handle_resume_stream(websocket: WebSocket, teacher_service, thread_id:
                 if "__interrupt__" in chunk:
                     has_interrupt = True
                     final_result = chunk
-                    logger.info(f"🔴 ANOTHER INTERRUPT DETECTED in chunk {chunk_count}")
-                    logger.info(f"Interrupt data: {chunk['__interrupt__']}")
+                    logger.info(f"🔴 ANOTHER INTERRUPT in chunk {chunk_count}")
                 else:
                     # Send progress update
                     await websocket.send_json({
@@ -287,42 +304,59 @@ async def handle_resume_stream(websocket: WebSocket, teacher_service, thread_id:
         final_state = teacher_service.workflow.graph.get_state(config)
         result = final_state.values if final_state else final_result
 
-        # Double-check for interrupt in final state
+        # Double-check for interrupt
         if not has_interrupt and result and "__interrupt__" in result:
             has_interrupt = True
-            logger.info("🔴 INTERRUPT DETECTED in final state after resume")
+            logger.info("🔴 INTERRUPT in final state after resume")
 
         logger.info(f"Resume complete - has_interrupt: {has_interrupt}")
 
         if has_interrupt:
-            # Another interrupt occurred
+            # Another interrupt occurred - extract AI message
+            messages = result.get("messages", [])
+            
+            ai_message = None
+            for msg in reversed(messages):
+                if hasattr(msg, 'type') and msg.type == 'ai':
+                    ai_message = msg.content
+                    break
+            
+            if not ai_message:
+                ai_message = "Please provide your information"
+            
             interrupts = result.get("__interrupt__", [])
-            interrupt_value = interrupts[0].value if interrupts else "Please provide your information"
+            interrupt_value = interrupts[0].value if interrupts else "user_input_required"
 
-            logger.info(f"Sending another interrupt to client: {interrupt_value}")
+            logger.info(f"Sending another interrupt: {ai_message[:100]}...")
 
-            # Send interrupt notification
             await websocket.send_json({
                 "type": "interrupt",
-                "message": interrupt_value,
+                "message": ai_message,
+                "interrupt_id": interrupt_value,
                 "stage": "awaiting_user_input",
-                "thread_id": thread_id
+                "thread_id": thread_id,
+                "current_slide_index": result.get("current_slide_index", 0),
+                "total_slides": len(result.get("slides", []))
             })
         else:
             # No interrupt - send final response
             teacher_service.sessions.add(thread_id)
 
-            ai_message = result["messages"][-1].content if result.get("messages") else ""
+            messages = result.get("messages", [])
+            ai_message = ""
+            
+            for msg in reversed(messages):
+                if hasattr(msg, 'type') and msg.type == 'ai':
+                    ai_message = msg.content
+                    break
+
             current_slide_index = result.get("current_slide_index", 0)
             slides = result.get("slides", [])
 
-            # Get slide data
+            slide_data = None
             if slides and current_slide_index < len(slides):
                 slide_data = slides[current_slide_index]
-            else:
-                slide_data = None
 
-            # Send final response
             await websocket.send_json({
                 "type": "response",
                 "message": ai_message,
@@ -335,7 +369,6 @@ async def handle_resume_stream(websocket: WebSocket, teacher_service, thread_id:
                 "total_slides": len(slides)
             })
 
-        # Send stream end
         await websocket.send_json({
             "type": "stream_end"
         })
