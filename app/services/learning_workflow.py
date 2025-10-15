@@ -303,16 +303,14 @@ class LearningWorkflow:
             ])
             
             state["messages"].append(intro_response)
-            
-            # Create welcome slide
-            welcome_slide = {
-                "slide_number": 0,
-                "title": "Meet Meemo!",
-                "content": intro_response.content,
-                "visual_description": "Friendly robot character waving hello",
-                "full_content": intro_response.content,
-                "topic": "Introduction"
-            }
+
+            # Generate welcome slide with visual
+            welcome_slide = self._generate_slide(
+                intro_response.content,
+                "Meet Meemo!",
+                "Introduction and welcome",
+                slide_number=0
+            )
             state["slides"].append(welcome_slide)
             state["current_slide_index"] = 0
 
@@ -791,6 +789,87 @@ FEEDBACK: [Your detailed feedback here]
                 "visual_description": f"Illustration showing {context}",
                 "full_content": content or "",
                 "topic": title or "Topic"
+            }
+            
+    def _generate_slide(self, content: str, title: str, context: str, slide_number: int) -> dict:
+        """
+        Generate slide content with visual diagrams from AI response.
+        """
+        try:
+            logger.debug(f"Generating slide {slide_number}: {title}")
+
+            slide_prompt = f"""Based on this teaching content, create a visual slide description:
+
+    Content: {content}
+
+    Extract:
+    1. Key points (2-3 bullet points)
+    2. Visual description: Describe the diagram/illustration that should be shown
+    - What structures to show
+    - What colors to use
+    - Labels and annotations
+    - Spatial relationships
+
+    Format as JSON with keys: "key_points" (array) and "visual_description" (string)."""
+
+            try:
+                slide_response = self.model.invoke([SystemMessage(content=slide_prompt)])
+                
+                # Try to parse as JSON
+                import json
+                try:
+                    slide_json = json.loads(slide_response.content.strip())
+                    visual_desc = slide_json.get("visual_description", "")
+                    key_points = slide_json.get("key_points", [])
+                except json.JSONDecodeError:
+                    # Fallback to plain text
+                    visual_desc = slide_response.content
+                    key_points = []
+                    
+            except Exception as e:
+                logger.warning(f"Failed to generate visual description: {str(e)}")
+                visual_desc = "Illustration showing " + context
+                key_points = []
+
+            # Generate actual visual diagram
+            from app.services.visual_generator import get_visual_generator
+            visual_gen = get_visual_generator()
+            visual_data = visual_gen.generate_visual(visual_desc, title, content)
+
+            slide_data = {
+                "slide_number": slide_number,
+                "title": title or "Learning Slide",
+                "content": content[:300] if content else "Content not available",
+                "visual_description": visual_desc,
+                "full_content": content or "",
+                "topic": title or "Topic",
+                "key_points": key_points,
+                # NEW: Visual diagram data
+                "visual": {
+                    "type": visual_data["type"],  # "mermaid", "svg", "premade", "none"
+                    "data": visual_data["data"],
+                    "fallback_text": visual_data["fallback_text"]
+                }
+            }
+
+            logger.debug(f"Slide {slide_number} generated with visual type: {visual_data['type']}")
+            return slide_data
+
+        except Exception as e:
+            logger.error(f"Error generating slide: {str(e)}", exc_info=True)
+            return {
+                "slide_number": slide_number,
+                "title": title or "Learning Slide",
+                "content": content[:300] if content else "Content unavailable",
+                "visual_description": f"Illustration showing {context}",
+                "full_content": content or "",
+                "topic": title or "Topic",
+                "key_points": [],
+                "visual": {
+                    "type": "none",
+                    "data": None,
+                    "fallback_text": f"Illustration showing {context}"
+                }
             }
         
     def initialize_state(self) -> LearningState:
