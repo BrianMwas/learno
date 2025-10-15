@@ -52,8 +52,8 @@ learno/
 # 1. Setup environment
 make setup
 
-# 2. Edit .env.docker with your OpenAI API key
-nano .env.docker
+# 2. Edit .env with your OpenAI API key
+nano .env
 
 # 3. Start services
 make up
