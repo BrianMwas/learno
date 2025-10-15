@@ -1,123 +1,37 @@
 from langchain_core.messages import HumanMessage
 from app.models.schemas import SlideContent
 from app.services.learning_workflow import LearningWorkflow
-from langgraph.types import Command
+from typing import AsyncGenerator, Dict, Any
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
 
 class AITeacherService:
-    """AI Teacher service using LangGraph workflow."""
+    """AI Teacher service using LangGraph workflow with streaming support."""
 
     def __init__(self):
         self.workflow = LearningWorkflow()
-        # Track which sessions have been created (just for existence check)
         self.sessions = set()
 
-    def resume_with_answer(self, thread_id: str, answer: str) -> tuple[str, SlideContent, str, str]:
+    async def chat_stream(
+        self, 
+        user_message: str, 
+        thread_id: str
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Resume a paused workflow with user's answer to an interrupt.
-        This is called after an interrupt requesting user input.
-
-        Args:
-            thread_id: The session thread ID
-            answer: User's answer (e.g., their name or learning goal)
-
-        Returns:
-            Tuple of (ai_message, slide_content, thread_id, current_stage)
-
-        Raises:
-            ValueError: If thread_id or answer is invalid
-            Exception: For other processing errors
-        """
-        try:
-            if not thread_id or not thread_id.strip():
-                raise ValueError("Thread ID cannot be empty")
-
-            if answer is None:
-                raise ValueError("Answer cannot be None")
-
-            logger.info(f"Resuming workflow with answer for thread_id: {thread_id}")
-
-            config = {"configurable": {"thread_id": thread_id}}
-
-            # Resume the graph with Command(resume=answer)
-            # The interrupt() call in the node will return this value
-            result = self.workflow.graph.invoke(Command(resume=answer), config=config)
-            logger.info(f"Graph resumed successfully")
-
-            # Check if another interrupt occurred
-            if "__interrupt__" in result:
-                logger.info("Another interrupt encountered during resume")
-
-                interrupts = result["__interrupt__"]
-                interrupt_value = interrupts[0].value if interrupts else "Please provide your information"
-
-                slide = SlideContent(
-                    title="Getting Started",
-                    content=interrupt_value,
-                    code_example=None,
-                    visual_description="User information prompt"
-                )
-
-                return interrupt_value, slide, thread_id, "awaiting_user_input"
-
-            # Mark session as active
-            self.sessions.add(thread_id)
-
-            if not result.get("messages"):
-                raise ValueError("No messages in workflow result after resume")
-
-            ai_message = result["messages"][-1].content
-
-            current_slide_index = result.get("current_slide_index", 0)
-            slides = result.get("slides", [])
-
-            logger.info(f"Resume result - slides: {len(slides)}, index: {current_slide_index}")
-
-            if slides and current_slide_index < len(slides):
-                slide_data = slides[current_slide_index]
-                slide = SlideContent(
-                    title=slide_data.get("title", "Learning Slide"),
-                    content=slide_data.get("content", ai_message[:200] if ai_message else "Content unavailable"),
-                    code_example=slide_data.get("code_example"),
-                    visual_description=slide_data.get("visual_description", "Illustration of the concept")
-                )
-            else:
-                slide = SlideContent(
-                    title="Learning Session",
-                    content=ai_message[:200] if ai_message else "Content unavailable",
-                    code_example=None,
-                    visual_description="Illustration of the concept"
-                )
-
-            current_stage = result.get("current_stage", "teaching")
-
-            logger.info(f"Workflow resumed successfully for thread_id: {thread_id}, stage: {current_stage}")
-            return ai_message, slide, thread_id, current_stage
-
-        except ValueError as e:
-            logger.error(f"Validation error in resume_with_answer: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Error resuming workflow for thread_id {thread_id}: {str(e)}", exc_info=True)
-            raise Exception(f"Failed to resume workflow: {str(e)}")
-
-    async def chat(self, user_message: str, thread_id: str) -> tuple[str, SlideContent, str, str]:
-        """
-        Process a chat message through the learning workflow.
+        Stream chat responses through the learning workflow.
 
         Args:
             user_message: The user's message
             thread_id: Thread ID for conversation continuity
 
-        Returns:
-            Tuple of (ai_message, slide_content, thread_id, current_stage)
+        Yields:
+            Dictionary chunks with types: 'token', 'slide', 'stage', 'complete', 'error'
 
         Raises:
             ValueError: If user_message or thread_id is invalid
-            Exception: For other processing errors
         """
         try:
             if not user_message or not user_message.strip():
@@ -126,112 +40,166 @@ class AITeacherService:
             if not thread_id or not thread_id.strip():
                 raise ValueError("Thread ID cannot be empty")
 
-            logger.info(f"Processing chat for thread_id: {thread_id}, message: {user_message[:50]}")
+            logger.info(f"Streaming chat for thread_id: {thread_id}, message: {user_message[:50]}")
 
-            # Configuration for checkpointer - let LangGraph manage state
             config = {"configurable": {"thread_id": thread_id}}
 
-            # For new conversations, we need to pass initial state
-            # For existing conversations, LangGraph loads from checkpoint
+            # Prepare input data
             if thread_id not in self.sessions:
                 logger.info(f"New session - initializing state for thread_id: {thread_id}")
-                # Initialize state and add user message
                 initial_state = self.workflow.initialize_state()
                 initial_state["messages"].append(HumanMessage(content=user_message))
                 input_data = initial_state
             else:
                 logger.info(f"Existing session for thread_id: {thread_id}")
-                # Just pass the new message - LangGraph will load the rest from checkpoint
                 input_data = {"messages": [HumanMessage(content=user_message)]}
 
-            # Invoke the graph
-            logger.info(f"Invoking graph for thread_id: {thread_id}")
-            result = self.workflow.graph.invoke(input_data, config=config)
-            logger.info(f"Graph execution completed for thread_id: {thread_id}")
+            # Stream the graph execution
+            full_message = ""
+            current_slide = None
+            current_stage = None
 
-            # Check if graph paused due to interrupt
-            if "__interrupt__" in result:
-                logger.info(f"Graph interrupted - waiting for user input")
+            # Use astream for async streaming
+            async for chunk in self.workflow.graph.astream(input_data, config=config, stream_mode="updates"):
+                logger.debug(f"Stream chunk: {chunk.keys() if isinstance(chunk, dict) else type(chunk)}")
 
-                # Extract interrupt value (the prompt string)
-                interrupts = result["__interrupt__"]
-                interrupt_value = interrupts[0].value if interrupts else "Please provide your information"
+                # Extract node updates
+                for node_name, node_output in chunk.items():
+                    if node_name == "__end__":
+                        continue
 
-                logger.info(f"Interrupt prompt: {interrupt_value}")
+                    logger.info(f"Node '{node_name}' produced output")
 
-                # Mark that we have a session (even though it's paused)
-                self.sessions.add(thread_id)
+                    # Extract stage information
+                    if "current_stage" in node_output:
+                        current_stage = node_output["current_stage"]
+                        yield {
+                            "type": "stage",
+                            "stage": current_stage,
+                            "node": node_name
+                        }
 
-                # Create a response indicating we need user input
-                slide = SlideContent(
-                    title="Getting Started",
-                    content=interrupt_value,
-                    code_example=None,
-                    visual_description="User information prompt"
-                )
+                    # Extract messages and stream tokens
+                    if "messages" in node_output and node_output["messages"]:
+                        last_message = node_output["messages"][-1]
+                        
+                        if hasattr(last_message, "content"):
+                            message_content = last_message.content
+                            
+                            # Stream the new content (delta from previous)
+                            if len(message_content) > len(full_message):
+                                delta = message_content[len(full_message):]
+                                full_message = message_content
+                                
+                                yield {
+                                    "type": "token",
+                                    "content": delta,
+                                    "node": node_name
+                                }
 
-                # Return with special stage so frontend knows to collect input
-                return interrupt_value, slide, thread_id, "awaiting_user_input"
+                    # Extract slide information
+                    if "slides" in node_output and node_output["slides"]:
+                        current_slide_index = node_output.get("current_slide_index", len(node_output["slides"]) - 1)
+                        if current_slide_index < len(node_output["slides"]):
+                            slide_data = node_output["slides"][current_slide_index]
+                            current_slide = SlideContent(
+                                title=slide_data.get("title", "Learning Slide"),
+                                content=slide_data.get("content", "Content unavailable"),
+                                code_example=slide_data.get("code_example"),
+                                visual_description=slide_data.get("visual_description", "Illustration")
+                            )
+                            
+                            yield {
+                                "type": "slide",
+                                "slide": current_slide.dict(),
+                                "slide_index": current_slide_index,
+                                "total_slides": len(node_output["slides"])
+                            }
 
-            # Update session marker
+            # Mark session as active
             self.sessions.add(thread_id)
 
-            # Extract response
-            if not result.get("messages"):
-                raise ValueError("No messages in workflow result")
+            # Get final state for completion info
+            final_state = self.workflow.graph.get_state(config)
+            if final_state and final_state.values:
+                state_values = final_state.values
+                
+                # Send completion event with full state
+                yield {
+                    "type": "complete",
+                    "message": full_message,
+                    "thread_id": thread_id,
+                    "stage": state_values.get("current_stage", "teaching"),
+                    "slide": current_slide.dict() if current_slide else None,
+                    "session_info": {
+                        "current_topic": state_values.get("current_topic"),
+                        "topics_covered": state_values.get("topics_covered", []),
+                        "topics_remaining": state_values.get("topics_remaining", []),
+                        "understanding_level": state_values.get("understanding_level", "beginner"),
+                        "assessments_passed": state_values.get("assessments_passed", 0),
+                        "questions_asked": state_values.get("questions_asked", 0)
+                    }
+                }
 
-            ai_message = result["messages"][-1].content
-            logger.info(f"AI response generated: {ai_message[:100]}")
+            logger.info(f"Stream completed for thread_id: {thread_id}")
 
-            # Get current slide from slides collection
-            current_slide_index = result.get("current_slide_index", 0)
-            slides = result.get("slides", [])
+        except ValueError as e:
+            logger.error(f"Validation error in chat_stream: {str(e)}")
+            yield {"type": "error", "error": str(e), "error_type": "validation"}
+        except Exception as e:
+            logger.error(f"Error streaming chat for thread_id {thread_id}: {str(e)}", exc_info=True)
+            yield {"type": "error", "error": f"Failed to process message: {str(e)}", "error_type": "processing"}
 
-            logger.info(f"Slides count: {len(slides)}, current_index: {current_slide_index}")
+    async def chat(self, user_message: str, thread_id: str) -> tuple[str, SlideContent, str, str]:
+        """
+        Non-streaming chat (for backwards compatibility).
+        Internally uses streaming but collects the full response.
 
-            # Create slide with proper defaults
-            if slides and current_slide_index < len(slides):
-                slide_data = slides[current_slide_index]
-                logger.info(f"Using slide at index {current_slide_index}: {slide_data.get('title')}")
+        Args:
+            user_message: The user's message
+            thread_id: Thread ID for conversation continuity
 
-                slide = SlideContent(
-                    title=slide_data.get("title", "Learning Slide"),
-                    content=slide_data.get("content", ai_message[:200] if ai_message else "Content unavailable"),
-                    code_example=slide_data.get("code_example"),
-                    visual_description=slide_data.get("visual_description", "Illustration of the concept")
-                )
-            else:
-                # Fallback slide when no slides exist yet
-                logger.warning(f"No slides available - using fallback")
+        Returns:
+            Tuple of (ai_message, slide_content, thread_id, current_stage)
+        """
+        try:
+            full_message = ""
+            slide = None
+            stage = "teaching"
+
+            # Collect from stream
+            async for chunk in self.chat_stream(user_message, thread_id):
+                if chunk["type"] == "token":
+                    full_message += chunk["content"]
+                elif chunk["type"] == "slide":
+                    slide = SlideContent(**chunk["slide"])
+                elif chunk["type"] == "stage":
+                    stage = chunk["stage"]
+                elif chunk["type"] == "complete":
+                    full_message = chunk["message"]
+                    if chunk["slide"]:
+                        slide = SlideContent(**chunk["slide"])
+                    stage = chunk["stage"]
+                elif chunk["type"] == "error":
+                    raise Exception(chunk["error"])
+
+            # Fallback slide if none created
+            if not slide:
                 slide = SlideContent(
                     title="Learning Session",
-                    content=ai_message[:200] if ai_message else "Content unavailable",
+                    content=full_message[:200] if full_message else "Content unavailable",
                     code_example=None,
                     visual_description="Illustration of the concept"
                 )
 
-            current_stage = result.get("current_stage", "teaching")
+            return full_message, slide, thread_id, stage
 
-            logger.info(f"Chat processed successfully for thread_id: {thread_id}, stage: {current_stage}")
-            return ai_message, slide, thread_id, current_stage
-
-        except ValueError as e:
-            logger.error(f"Validation error in chat: {str(e)}")
-            raise
         except Exception as e:
-            logger.error(f"Error processing chat for thread_id {thread_id}: {str(e)}", exc_info=True)
-            raise Exception(f"Failed to process chat message: {str(e)}")
+            logger.error(f"Error in non-streaming chat: {str(e)}")
+            raise
 
     def get_session_info(self, thread_id: str) -> dict:
-        """
-        Get information about a learning session.
-
-        Args:
-            thread_id: The session thread ID
-
-        Returns:
-            Dictionary containing session information, empty dict if session not found
-        """
+        """Get information about a learning session."""
         try:
             if not thread_id or not thread_id.strip():
                 logger.warning("Empty thread_id provided to get_session_info")
@@ -241,7 +209,6 @@ class AITeacherService:
                 logger.info(f"Session not found for thread_id: {thread_id}")
                 return {}
 
-            # Get state from checkpointer
             config = {"configurable": {"thread_id": thread_id}}
             try:
                 state = self.workflow.graph.get_state(config)
@@ -259,7 +226,10 @@ class AITeacherService:
                     "questions_asked": state_values.get("questions_asked", 0),
                     "understanding_level": state_values.get("understanding_level", "beginner"),
                     "current_slide_index": state_values.get("current_slide_index", 0),
-                    "total_slides": len(state_values.get("slides", []))
+                    "total_slides": len(state_values.get("slides", [])),
+                    "user_name": state_values.get("user_name"),
+                    "learning_goal": state_values.get("learning_goal"),
+                    "assessments_passed": state_values.get("assessments_passed", 0)
                 }
             except Exception as e:
                 logger.error(f"Error reading from checkpointer: {str(e)}")
@@ -270,15 +240,7 @@ class AITeacherService:
             return {}
 
     def get_all_slides(self, thread_id: str) -> list[dict]:
-        """
-        Get all slides for a session.
-
-        Args:
-            thread_id: The session thread ID
-
-        Returns:
-            List of slide dictionaries, empty list if session not found
-        """
+        """Get all slides for a session."""
         try:
             if not thread_id or not thread_id.strip():
                 logger.warning("Empty thread_id provided to get_all_slides")
@@ -288,7 +250,6 @@ class AITeacherService:
                 logger.info(f"Session not found for thread_id: {thread_id}")
                 return []
 
-            # Get state from checkpointer
             config = {"configurable": {"thread_id": thread_id}}
             try:
                 state = self.workflow.graph.get_state(config)
@@ -304,21 +265,8 @@ class AITeacherService:
             logger.error(f"Error getting slides for thread_id {thread_id}: {str(e)}", exc_info=True)
             return []
 
-
     def navigate_slide(self, thread_id: str, direction: str) -> dict | None:
-        """
-        Navigate to next or previous slide.
-
-        Args:
-            thread_id: The session thread ID
-            direction: Either "next" or "previous"
-
-        Returns:
-            Slide dictionary if navigation successful, None otherwise
-
-        Raises:
-            ValueError: If direction is invalid
-        """
+        """Navigate to next or previous slide."""
         try:
             if not thread_id or not thread_id.strip():
                 logger.warning("Empty thread_id provided to navigate_slide")
@@ -331,7 +279,6 @@ class AITeacherService:
                 logger.info(f"Session not found for thread_id: {thread_id}")
                 return None
 
-            # Get and update state from checkpointer
             config = {"configurable": {"thread_id": thread_id}}
             try:
                 checkpoint = self.workflow.graph.get_state(config)
@@ -353,13 +300,12 @@ class AITeacherService:
                     new_index = current_index - 1
 
                 if new_index is not None:
-                    # Update the state in checkpointer
                     state["current_slide_index"] = new_index
                     self.workflow.graph.update_state(config, state)
                     logger.info(f"Navigated to slide {new_index} for thread_id: {thread_id}")
                     return slides[new_index]
                 else:
-                    logger.info(f"Cannot navigate {direction} from slide {current_index} for thread_id: {thread_id}")
+                    logger.info(f"Cannot navigate {direction} from slide {current_index}")
                     return None
 
             except Exception as e:
@@ -379,15 +325,7 @@ _teacher_service = None
 
 
 def get_teacher_service() -> AITeacherService:
-    """
-    Get or create the AI teacher service instance.
-
-    Returns:
-        Singleton instance of AITeacherService
-
-    Raises:
-        Exception: If service initialization fails
-    """
+    """Get or create the AI teacher service instance."""
     global _teacher_service
     try:
         if _teacher_service is None:

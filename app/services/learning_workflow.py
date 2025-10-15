@@ -1,5 +1,5 @@
 """
-LangGraph workflow for managing the learning progression.
+LangGraph workflow for managing the learning progression with agentic tools.
 """
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -8,33 +8,36 @@ from langchain.chat_models import init_chat_model
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from app.models.learning_state import LearningState
-from langgraph.types import RetryPolicy, interrupt
+from langgraph.types import RetryPolicy
 from app.core.config import get_settings
 from app.core.course_config import get_curriculum
+from app.models.schemas import AssessmentEvaluation, ConversationAnalysis, GoalExtraction, NameExtraction
 from app.utils.error_messages import get_stage_error_message
+from pydantic import BaseModel, Field
+from typing import Optional, Literal
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+# ========== STRUCTURED OUTPUT SCHEMAS ==========
 
 
 class LearningWorkflow:
-    """Manages the learning workflow using LangGraph."""
+    """Manages the learning workflow using LangGraph with agentic tools."""
 
     def __init__(self):
         try:
             logger.info("Initializing LearningWorkflow")
 
-            # Set up rate limiter to prevent rapid consecutive requests
             rate_limiter = InMemoryRateLimiter(
                 requests_per_second=settings.RATE_LIMIT_REQUESTS_PER_SECOND,
                 check_every_n_seconds=settings.RATE_LIMIT_CHECK_INTERVAL,
                 max_bucket_size=settings.RATE_LIMIT_MAX_BURST,
             )
 
-            # Initialize model with rate limiter and API key
             self.model = init_chat_model(
                 f"openai:{settings.OPENAI_MODEL}",
                 temperature=0.7,
@@ -55,7 +58,6 @@ class LearningWorkflow:
         """Build the learning workflow graph."""
         graph_builder = StateGraph(LearningState)
 
-        # Create retry policy for resilience against transient failures
         retry_policy = RetryPolicy(
             max_attempts=settings.RETRY_MAX_ATTEMPTS,
             backoff_factor=settings.RETRY_BACKOFF_FACTOR,
@@ -63,54 +65,17 @@ class LearningWorkflow:
             max_interval=settings.RETRY_MAX_INTERVAL,
         )
 
-        # Add nodes for each stage with retry policy
+        # Add nodes
         graph_builder.add_node("introduction", self.introduction_node, retry=retry_policy)
         graph_builder.add_node("teaching", self.teaching_node, retry=retry_policy)
         graph_builder.add_node("assessment", self.assessment_node, retry=retry_policy)
         graph_builder.add_node("evaluate_answer", self.evaluate_answer_node, retry=retry_policy)
         graph_builder.add_node("question_answering", self.question_answering_node, retry=retry_policy)
 
-        # Entry point: always check where to start
-        def entry_router(state: LearningState) -> str:
-            """Determine starting point based on state."""
-            logger.info(f"Entry router - user_name: {state.get('user_name')}, stage: {state.get('current_stage')}")
-
-            # If no user info, start with introduction
-            if not state.get("user_name"):
-                logger.info("No user_name - starting with introduction")
-                return "introduction"
-
-            # If we have partial info, continue introduction
-            if state.get("learning_goal") is None and state.get("current_stage") == "introduction":
-                logger.info("Partial user info - continuing introduction")
-                return "introduction"
-
-            # Check if we're waiting for an assessment answer
-            stage = state.get("current_stage", "introduction")
-            if stage == "assessment" and state.get("current_assessment_question"):
-                logger.info("Resuming with user's assessment answer - routing to evaluate_answer")
-                return "evaluate_answer"
-
-            logger.info(f"Using current_stage: {stage}")
-
-            # Map stages to node names
-            stage_map = {
-                "introduction": "introduction",
-                "teaching": "teaching",
-                "assessment": "assessment",
-                "evaluation_complete": "teaching",  # After eval, continue teaching
-                "needs_hint": "evaluate_answer",
-                "needs_retry": "evaluate_answer",
-                "needs_review": "teaching",
-                "question_answering": "question_answering"
-            }
-
-            return stage_map.get(stage, "teaching")
-
-        # Start routes to the appropriate node
+        # Entry routing
         graph_builder.add_conditional_edges(
             START,
-            entry_router,
+            self._entry_router,
             {
                 "introduction": "introduction",
                 "teaching": "teaching",
@@ -120,314 +85,231 @@ class LearningWorkflow:
             }
         )
 
-        # After each node, decide what to do next
-        def post_node_router(state: LearningState) -> str:
-            """Route after a node completes."""
-            current_stage = state.get("current_stage", "teaching")
-            messages = state.get("messages", [])
+        # Post-node routing
+        for node in ["introduction", "teaching", "assessment", "evaluate_answer", "question_answering"]:
+            graph_builder.add_conditional_edges(
+                node,
+                self._post_node_router,
+                {
+                    "teaching": "teaching",
+                    "assessment": "assessment",
+                    "evaluate_answer": "evaluate_answer",
+                    "question_answering": "question_answering",
+                    "end": END
+                }
+            )
 
-            logger.info(f"Post-node router - stage: {current_stage}, messages: {len(messages)}")
-
-            # Check for questions (but not during assessment)
-            if current_stage not in ["assessment", "needs_retry", "needs_hint", "needs_review"]:
-                if messages and len(messages) >= 2:
-                    last_msg = messages[-1]
-                    if isinstance(last_msg, HumanMessage) and "?" in last_msg.content:
-                        logger.info("Question detected - routing to question_answering")
-                        return "question_answering"
-
-            # Route based on stage
-            if current_stage == "introduction":
-                # Check if introduction is truly complete (has user_name and learning_goal)
-                if state.get("user_name") and state.get("learning_goal") is not None:
-                    # Introduction fully complete - move to teaching
-                    logger.info("Introduction complete - starting teaching")
-                    return "teaching"
-                else:
-                    # Still in introduction flow, end here to wait for user input
-                    logger.info("Introduction in progress - ending to wait for user response")
-                    return "end"
-
-            elif current_stage == "teaching":
-                # After teaching, do assessment
-                logger.info("Teaching done - moving to assessment")
-                return "assessment"
-
-            elif current_stage == "assessment":
-                # After assessment question is asked, end this cycle
-                # The next user input will resume and evaluate their answer
-                logger.info("Assessment question asked - ending to wait for user answer")
-                return "end"
-
-            elif current_stage == "evaluation_complete":
-                # Assessment passed, move to next topic or end
-                topics_remaining = state.get("topics_remaining", [])
-                if topics_remaining:
-                    # Move to next topic
-                    next_topic = topics_remaining[0]
-                    state["current_topic"] = next_topic
-                    state["topics_remaining"] = topics_remaining[1:]
-                    state["current_stage"] = "teaching"
-                    logger.info(f"Assessment passed - moving to topic: {next_topic}")
-                    return "teaching"
-                else:
-                    logger.info("No more topics - course complete")
-                    return "end"
-
-            elif current_stage == "needs_hint":
-                # Give a hint and wait for another attempt
-                logger.info("Providing hint - re-evaluating on next answer")
-                return "evaluate_answer"
-
-            elif current_stage == "needs_retry":
-                # Ask to try again - evaluate next answer
-                logger.info("Asking to retry - re-evaluating on next answer")
-                return "evaluate_answer"
-
-            elif current_stage == "needs_review":
-                # Review the topic again
-                logger.info("Review needed - going back to teaching")
-                state["current_stage"] = "teaching"
-                return "teaching"
-
-            elif current_stage == "question_answering":
-                # After answering, continue with current flow
-                logger.info("Question answered - continuing teaching")
-                return "teaching"
-
-            # Default
-            return "end"
-
-        # All nodes route through the post-node router
-        graph_builder.add_conditional_edges(
-            "introduction",
-            post_node_router,
-            {
-                "teaching": "teaching",
-                "assessment": "assessment",
-                "question_answering": "question_answering",
-                "end": END
-            }
-        )
-
-        graph_builder.add_conditional_edges(
-            "teaching",
-            post_node_router,
-            {
-                "teaching": "teaching",
-                "assessment": "assessment",
-                "question_answering": "question_answering",
-                "end": END
-            }
-        )
-
-        graph_builder.add_conditional_edges(
-            "assessment",
-            post_node_router,
-            {
-                "teaching": "teaching",
-                "assessment": "assessment",
-                "evaluate_answer": "evaluate_answer",
-                "question_answering": "question_answering",
-                "end": END
-            }
-        )
-
-        graph_builder.add_conditional_edges(
-            "evaluate_answer",
-            post_node_router,
-            {
-                "teaching": "teaching",
-                "assessment": "assessment",
-                "evaluate_answer": "evaluate_answer",
-                "question_answering": "question_answering",
-                "end": END
-            }
-        )
-
-        graph_builder.add_conditional_edges(
-            "question_answering",
-            post_node_router,
-            {
-                "teaching": "teaching",
-                "assessment": "assessment",
-                "evaluate_answer": "evaluate_answer",
-                "question_answering": "question_answering",
-                "end": END
-            }
-        )
-
-        # Compile with memory checkpointer for conversation persistence
         return graph_builder.compile(checkpointer=self.memory)
 
-    # ========== WORKFLOW NODES ==========
-    def introduction_node(self, state: LearningState) -> LearningState:
-        """
-        Introduction node - Meemo introduces itself, then collects user info.
-        
-        Flow:
-        1. First call (auto on connect): Generate greeting, wait for user response
-        2. After user says hello: Ask for name, interrupt
-        3. After name provided: Ask for goal, interrupt
-        4. After goal provided: Generate welcome, move to teaching
-        """
-        logger.info("Processing introduction node")
-        
-        has_initial_greeting = len(state.get("slides", [])) > 0
-        has_name = bool(state.get("user_name"))
-        has_goal = state.get("learning_goal") is not None
+    # ========== ROUTING METHODS ==========
+
+    def _entry_router(self, state: LearningState) -> str:
+        """Determine starting point based on state."""
+        logger.info(f"Entry router - stage: {state.get('current_stage')}")
+
+        if not state.get("user_name"):
+            return "introduction"
+
+        if state.get("learning_goal") is None and state.get("current_stage") == "introduction":
+            return "introduction"
+
+        stage = state.get("current_stage", "introduction")
+        if stage == "assessment" and state.get("current_assessment_question"):
+            return "evaluate_answer"
+
+        stage_map = {
+            "introduction": "introduction",
+            "teaching": "teaching",
+            "assessment": "assessment",
+            "evaluation_complete": "teaching",
+            "needs_hint": "evaluate_answer",
+            "needs_retry": "evaluate_answer",
+            "needs_review": "teaching",
+            "question_answering": "question_answering"
+        }
+
+        return stage_map.get(stage, "teaching")
+
+    def _post_node_router(self, state: LearningState) -> str:
+        """Route after node execution using agentic analysis."""
+        current_stage = state.get("current_stage", "teaching")
         messages = state.get("messages", [])
-        
-        # Count how many times user has sent messages (not AI responses)
-        user_message_count = sum(1 for m in messages if hasattr(m, 'type') and m.type == 'human')
-        
-        # STEP 1: First visit - generate greeting (no interrupt yet, wait for user to respond)
-        if not has_initial_greeting:
-            logger.info("Step 1: Generating initial greeting (no interrupt)")
-            
-            system_prompt = f"""You are Meemo, a friendly and enthusiastic AI learning companion.
 
-                Introduce yourself warmly:
-                1. Greet the user warmly
-                2. Introduce yourself as Meemo, their AI learning companion for {settings.COURSE_TOPIC}
-                3. Briefly explain what you'll do together (visual slides, examples, assessments, Q&A)
-                4. Express enthusiasm and ask them to say hello!
+        logger.info(f"Post-node router - stage: {current_stage}")
 
-                Be conversational, warm, and enthusiastic. Keep it to 3-4 sentences.
+        # Analyze last user message for intelligent routing
+        if messages and isinstance(messages[-1], HumanMessage) and current_stage not in ["assessment"]:
+            try:
+                analyzer = self.model.with_structured_output(ConversationAnalysis)
+                analysis = analyzer.invoke([
+                    SystemMessage(content=f"""Analyze this message in learning context.
 
-                **IMPORTANT: Format your response in markdown. Use headings, bold, italics, lists, etc. to make it engaging.**"""
+Current stage: {current_stage}
+Current topic: {state.get('current_topic', 'Unknown')}
+
+Determine the routing."""),
+                    HumanMessage(content=f"User message: {messages[-1].content}")
+                ])
+
+                if analysis.is_question and current_stage not in ["needs_retry", "needs_hint"]:
+                    logger.info("Detected question - routing to Q&A")
+                    return "question_answering"
+            except Exception as e:
+                logger.warning(f"Analysis failed, using stage-based routing: {e}")
+
+        # Stage-based routing
+        if current_stage == "introduction":
+            if state.get("user_name") and state.get("learning_goal") is not None:
+                return "teaching"
+            return "end"
+
+        elif current_stage == "teaching":
+            return "assessment"
+
+        elif current_stage == "assessment":
+            return "end"
+
+        elif current_stage == "evaluation_complete":
+            topics_remaining = state.get("topics_remaining", [])
+            if topics_remaining:
+                state["current_topic"] = topics_remaining[0]
+                state["topics_remaining"] = topics_remaining[1:]
+                state["current_stage"] = "teaching"
+                return "teaching"
+            return "end"
+
+        elif current_stage in ["needs_hint", "needs_retry"]:
+            return "evaluate_answer"
+
+        elif current_stage == "needs_review":
+            state["current_stage"] = "teaching"
+            return "teaching"
+
+        elif current_stage == "question_answering":
+            return "teaching"
+
+        return "end"
+
+    # ========== WORKFLOW NODES ==========
+
+    def introduction_node(self, state: LearningState) -> LearningState:
+        """Introduction with agentic name/goal extraction."""
+        logger.info("Processing introduction node with agentic tools")
+
+        messages = state.get("messages", [])
+        user_message_count = sum(1 for m in messages if isinstance(m, HumanMessage))
+
+        # STEP 1: Initial greeting
+        if user_message_count == 0:
+            logger.info("Generating initial greeting")
 
             intro_response = self.model.invoke([
-                SystemMessage(content=system_prompt),
+                SystemMessage(content=f"""You are Meemo, a friendly AI learning companion for {settings.COURSE_TOPIC}.
+
+Introduce yourself warmly (3-4 sentences):
+- Greet the user
+- Explain what you'll do together
+- Ask them to say hello
+
+**Use markdown formatting with emojis.**"""),
                 HumanMessage(content="(Generate greeting)")
             ])
-            
-            state["messages"].append(intro_response)
 
-            # Generate welcome slide with visual
+            state["messages"].append(intro_response)
             welcome_slide = self._generate_slide(
                 intro_response.content,
-                "Meet Meemo!",
-                "Introduction and welcome",
+                "Meet Meemo! 👋",
+                "Welcome",
                 slide_number=0
             )
             state["slides"].append(welcome_slide)
             state["current_slide_index"] = 0
-
-            # Important: Keep stage as "introduction" but we're not done yet
-            # The router should END here so user can respond
             state["current_stage"] = "introduction"
 
-            logger.info("Initial greeting generated, waiting for user to respond")
-            return state  # Don't interrupt - wait for user to say hello
-        
-        # STEP 2: User has responded (e.g., "Hello"), now ask for name and interrupt
-        if not has_name and user_message_count >= 1:
-            logger.info("Step 2: User responded, asking for name")
-            
-            user_greeting = messages[-1].content if messages else "Hello"
-            
-            system_prompt = f"""You are Meemo. The user just greeted you with: "{user_greeting}"
+            return state
 
-                Respond warmly:
-                1. Acknowledge their greeting naturally
-                2. Express excitement to meet them
-                3. Ask for their name in a friendly way
+        # STEP 2+: Extract information using agentic tools
+        has_name = bool(state.get("user_name"))
+        has_goal = state.get("learning_goal") is not None
+        last_user_message = messages[-1].content if messages and isinstance(messages[-1], HumanMessage) else ""
 
-                Be brief (2-3 sentences) and enthusiastic.
+        # Extract name if needed
+        if not has_name and last_user_message and user_message_count >= 1:
+            try:
+                name_extractor = self.model.with_structured_output(NameExtraction)
+                extraction = name_extractor.invoke([
+                    SystemMessage(content="""Extract name from message. Look for patterns like:
+- "I'm [Name]" or "My name is [Name]"
+- Just "[Name]" if short message after being asked"""),
+                    HumanMessage(content=f"User: {last_user_message}")
+                ])
 
-                **IMPORTANT: Format your response in markdown. Use bold, italics, emojis to make it friendly and engaging.**"""
+                if extraction.name and extraction.confidence in ["high", "medium"]:
+                    state["user_name"] = extraction.name
+                    has_name = True
+                    logger.info(f"✅ Name extracted: {extraction.name}")
+            except Exception as e:
+                logger.warning(f"Name extraction failed: {e}")
 
-            name_response = self.model.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_greeting)
+        # Extract goal if needed
+        if has_name and not has_goal and user_message_count >= 3:
+            try:
+                goal_extractor = self.model.with_structured_output(GoalExtraction)
+                extraction = goal_extractor.invoke([
+                    SystemMessage(content="""Extract learning goal or detect if user wants to skip.
+Look for goals like "I want to learn X" or skip words like "skip", "let's start"."""),
+                    HumanMessage(content=f"User: {last_user_message}")
+                ])
+
+                if extraction.wants_to_skip:
+                    state["learning_goal"] = None
+                    has_goal = True
+                elif extraction.goal:
+                    state["learning_goal"] = extraction.goal
+                    has_goal = True
+                logger.info(f"✅ Goal: {state.get('learning_goal', 'skipped')}")
+            except Exception as e:
+                logger.warning(f"Goal extraction failed: {e}")
+
+        # Generate appropriate response
+        if not has_name:
+            response = self.model.invoke([
+                SystemMessage(content="You are Meemo. Ask for their name warmly. **Use markdown.**"),
+                *messages[-2:]
             ])
-            
-            state["messages"].append(name_response)
-            logger.info("Asking for name, now interrupting")
-            
-            # Now interrupt for name
-            user_name = interrupt("Please provide your name")
-            state["user_name"] = user_name.strip() if user_name else "Student"
-            logger.info(f"User name received: {state['user_name']}")
-            # Re-check has_name after interrupt
-            has_name = True
-        
-        # STEP 3: Name collected, ask for goal and interrupt
-        if has_name and not has_goal:
-            logger.info("Step 3: Name collected, asking for learning goal")
-            
-            system_prompt = f"""You are Meemo. You just learned that the student's name is {state['user_name']}.
+            state["messages"].append(response)
 
-                Respond warmly:
-                1. Express excitement about meeting them by name
-                2. Ask about their learning goal for {settings.COURSE_TOPIC}
-                3. Mention they can say 'skip' if they want to dive right in
-
-                Be brief (2-3 sentences), enthusiastic, and use their name naturally.
-
-                **IMPORTANT: Format your response in markdown. Use bold, italics, emojis to make it friendly and engaging.**"""
-
-            goal_response = self.model.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=f"My name is {state['user_name']}")
+        elif not has_goal:
+            user_name = state.get("user_name", "friend")
+            response = self.model.invoke([
+                SystemMessage(content=f"""You are Meemo. Ask {user_name} about their learning goal for {settings.COURSE_TOPIC}.
+Mention they can say 'skip'. **Use markdown with emojis.**"""),
+                HumanMessage(content=f"Name: {user_name}")
             ])
-            
-            state["messages"].append(goal_response)
-            logger.info("Asking for goal, now interrupting")
-            
-            # Interrupt for learning goal
-            learning_goal = interrupt("Please share your learning goal (or type 'skip')")
+            state["messages"].append(response)
 
-            if learning_goal and learning_goal.strip().lower() not in ["skip", "let's start", "lets start", ""]:
-                state["learning_goal"] = learning_goal.strip()
-            else:
-                state["learning_goal"] = None
-
-            logger.info(f"Learning goal received: {state.get('learning_goal', 'None (skipped)')}")
-            # DON'T return yet - fall through to Step 4
-
-        # STEP 4: Both collected, generate final welcome and transition
-        # Re-check BOTH from state after potentially receiving from interrupts
-        has_name_now = bool(state.get("user_name"))
-        has_goal_now = state.get("learning_goal") is not None
-        logger.info(f"Step 4 check: has_name_now={has_name_now}, has_goal_now={has_goal_now}, user_name={state.get('user_name')}, goal={state.get('learning_goal')}")
-
-        if has_name_now and has_goal_now:
-            logger.info("✅ Step 4: Generating final welcome message")
-            
+        else:
+            # Complete introduction
             user_name = state.get("user_name", "Student")
             learning_goal = state.get("learning_goal")
-            
-            system_prompt = f"""You are Meemo, a friendly and enthusiastic AI learning companion.
-                You've just met {user_name}{' who wants to ' + learning_goal if learning_goal else ''}.
-
-                Give {user_name} a warm, personalized welcome:
-                1. Express excitement to work with them by name
-                2. Brief overview of the {settings.COURSE_TOPIC} course structure
-                3. Mention you'll start with: {self.curriculum[0] if self.curriculum else "the basics"}
-                {"4. Acknowledge their goal: " + learning_goal if learning_goal else ""}
-
-                Keep it warm, encouraging, and conversational. End with enthusiasm about starting!
-
-                Course topics we'll cover: {', '.join(self.curriculum[:5])}
-
-                **IMPORTANT: Format your response in markdown. Use headings, bold, italics, lists, emojis to make it engaging and well-structured.**"""
 
             response = self.model.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=f"(Generate personalized welcome for {user_name})")
+                SystemMessage(content=f"""Generate personalized welcome for {user_name}.
+Goal: {learning_goal or 'general learning'}
+First topic: {self.curriculum[0] if self.curriculum else 'basics'}
+Topics: {', '.join(self.curriculum[:5])}
+
+**Use markdown with headings, lists, emojis.**"""),
+                HumanMessage(content="(Generate welcome)")
             ])
-            
-            # Generate welcome slide
+
             slide = self._generate_slide(
                 response.content,
-                f"Welcome, {user_name}!",
-                "Personalized course welcome",
+                f"Welcome, {user_name}! 🎉",
+                "Course welcome",
                 slide_number=1
             )
-            
-            # Update state for teaching phase
+
             state["messages"].append(response)
             state["current_stage"] = "teaching"
             state["current_topic"] = self.curriculum[0] if self.curriculum else "Introduction"
@@ -435,428 +317,194 @@ class LearningWorkflow:
             state["topics_covered"] = []
             state["slides"].append(slide)
             state["current_slide_index"] = 1
-            
-            logger.info("Introduction completed, transitioning to teaching")
-        
-        return state
-    
-    
-    def teaching_node(self, state: LearningState) -> LearningState:
-        """
-        Teaching node - teaches the current topic with visual descriptions.
 
-        Raises:
-            Exception: If teaching content generation fails
-        """
+        return state
+
+    def teaching_node(self, state: LearningState) -> LearningState:
+        """Teach current topic."""
         try:
             current_topic = state.get("current_topic", "Biology")
-            logger.info(f"Processing teaching node for topic: {current_topic}")
-
-            # Get stream writer for real-time updates
-            try:
-                writer = get_stream_writer()
-            except Exception:
-                writer = None
-
-            if writer:
-                writer({"type": "status", "message": f"📚 Teaching about {current_topic}...", "stage": "teaching"})
-
-            system_prompt = f"""You are teaching {current_topic} in a Cell Biology course.
-
-Explain this topic clearly with:
-1. Clear definition and function
-2. Key characteristics
-3. Visual description (describe what it looks like, its structure, colors to use in diagrams)
-4. How it relates to the cell's overall function
-
-Keep it concise (3-4 paragraphs). Use analogies when helpful.
-Remember: this is for visual slides, so be descriptive about the structure and appearance.
-
-**IMPORTANT: Format your response in markdown with proper structure:**
-- Use headings (##, ###) for sections
-- Use **bold** for key terms
-- Use bullet points or numbered lists
-- Use code blocks for any technical terms or formulas
-- Add emojis where appropriate to make it engaging"""
-
-            # Get user message
-            user_msg = state["messages"][-1].content if state["messages"] else f"Teach me about {current_topic}"
+            logger.info(f"Teaching: {current_topic}")
 
             response = self.model.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_msg)
+                SystemMessage(content=f"""Teach {current_topic} in Cell Biology.
+
+Include:
+1. Clear definition
+2. Key characteristics
+3. Visual description for diagrams
+4. Relevance to cells
+
+3-4 paragraphs. **Use markdown: headings, bold, lists, emojis.**"""),
+                HumanMessage(content=f"Teach {current_topic}")
             ])
 
-            # Generate slide - each topic gets its own slide
             slide_number = len(state["slides"])
             slide = self._generate_slide(
                 response.content,
                 current_topic,
-                f"Learning about {current_topic}",
+                f"Learning {current_topic}",
                 slide_number=slide_number
             )
 
-            # Update state - append new slide
             state["messages"].append(response)
             state["slides"].append(slide)
             state["current_slide_index"] = slide_number
 
-            # Mark topic as covered
-            if current_topic and current_topic not in state.get("topics_covered", []):
+            if current_topic not in state.get("topics_covered", []):
                 state["topics_covered"].append(current_topic)
-                logger.info(f"Marked topic as covered: {current_topic}")
 
-            # Move to assessment stage
             state["current_stage"] = "assessment"
-
-            logger.info(f"Teaching node completed successfully for topic: {current_topic}")
             return state
 
         except Exception as e:
-            logger.error(f"Error in teaching_node: {str(e)}", exc_info=True)
-            friendly_message = get_stage_error_message("teaching")
-            state["messages"].append(AIMessage(content=friendly_message))
-            raise Exception(friendly_message)
+            logger.error(f"Teaching error: {e}")
+            state["messages"].append(AIMessage(content=get_stage_error_message("teaching")))
+            raise
 
     def assessment_node(self, state: LearningState) -> LearningState:
-        """
-        Assessment node - generates a question to check understanding.
-
-        Raises:
-            Exception: If assessment generation fails
-        """
+        """Generate assessment question."""
         try:
-            current_topic = state.get("current_topic", "Biology")
-            logger.info(f"Processing assessment node for topic: {current_topic}")
+            current_topic = state.get("current_topic")
 
-            # Get stream writer for real-time updates
-            try:
-                writer = get_stream_writer()
-            except Exception:
-                writer = None
-
-            if writer:
-                writer({"type": "status", "message": f"📝 Preparing assessment for {current_topic}...", "stage": "assessment"})
-
-            # Check if we already have an assessment question for this topic
             if state.get("current_assessment_question"):
-                logger.info("Assessment question already exists, waiting for answer")
                 return state
 
-            system_prompt = f"""You just taught about {current_topic}.
-
-Ask the student ONE clear question to check their understanding of the key concepts.
-Make it:
-- Specific to what was just taught
-- Not too difficult (appropriate for a beginner)
-- Open-ended enough to assess understanding
-- Engaging and friendly
-
-Just ask the question - don't provide answers or hints yet.
-
-**IMPORTANT: Format your question in markdown. Use bold for emphasis and emojis to make it friendly.**"""
-
             response = self.model.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content="Please check my understanding.")
+                SystemMessage(content=f"""Ask ONE clear question about {current_topic}.
+Make it beginner-friendly and open-ended.
+**Use markdown with bold and emojis.**"""),
+                HumanMessage(content="Check understanding")
             ])
 
-            # Store the assessment question
             state["current_assessment_question"] = response.content
             state["assessment_attempts"] = 0
             state["messages"].append(response)
             state["current_stage"] = "assessment"
 
-            logger.info(f"Assessment question generated for topic: {current_topic}")
             return state
 
         except Exception as e:
-            logger.error(f"Error in assessment_node: {str(e)}", exc_info=True)
-            friendly_message = get_stage_error_message("assessment")
-            state["messages"].append(AIMessage(content=friendly_message))
-            raise Exception(friendly_message)
+            logger.error(f"Assessment error: {e}")
+            state["messages"].append(AIMessage(content=get_stage_error_message("assessment")))
+            raise
 
     def evaluate_answer_node(self, state: LearningState) -> LearningState:
-        """
-        Evaluate student's answer to assessment question.
-
-        Analyzes the answer for understanding, provides feedback,
-        and updates understanding metrics.
-
-        Raises:
-            Exception: If evaluation fails
-        """
+        """Evaluate answer using structured output."""
         try:
-            current_topic = state.get("current_topic", "Biology")
-            assessment_question = state.get("current_assessment_question")
+            current_topic = state.get("current_topic")
+            question = state.get("current_assessment_question")
+            answer = state["messages"][-1].content if state["messages"] else ""
 
-            logger.info(f"Evaluating answer for topic: {current_topic}")
-
-            # Get stream writer for real-time updates
-            try:
-                writer = get_stream_writer()
-            except Exception:
-                writer = None
-
-            if writer:
-                writer({"type": "status", "message": "🤔 Evaluating your answer...", "stage": "evaluating"})
-
-            # Get the student's answer (last message)
-            student_answer = state["messages"][-1].content if state["messages"] else ""
-
-            # Increment attempts
             state["assessment_attempts"] = state.get("assessment_attempts", 0) + 1
             attempts = state["assessment_attempts"]
 
-            system_prompt = f"""You are evaluating a student's understanding of {current_topic}.
-
-The assessment question was: {assessment_question}
-
-The student's answer is: {student_answer}
-
-Evaluate their answer and provide:
-1. A judgment: "correct", "partial", or "incorrect"
-2. Specific feedback on what they got right or wrong
-3. Encouragement and next steps
-
-Be supportive and constructive. If they're close but not quite right, acknowledge what they understand.
-
-Respond in this format:
-JUDGMENT: [correct/partial/incorrect]
-FEEDBACK: [Your detailed feedback here]
-
-**IMPORTANT: Format the FEEDBACK section in markdown with proper structure, using bold, lists, and emojis for engagement.**"""
-
-            evaluation_response = self.model.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content="Please evaluate this answer.")
+            # Structured evaluation
+            evaluator = self.model.with_structured_output(AssessmentEvaluation)
+            evaluation = evaluator.invoke([
+                SystemMessage(content=f"""Evaluate understanding of {current_topic}.
+Question: {question}
+Answer: {answer}
+Attempt: {attempts}"""),
+                HumanMessage(content="Evaluate answer")
             ])
 
-            # Parse the evaluation
-            evaluation_text = evaluation_response.content
-            logger.info(f"Evaluation response: {evaluation_text[:200]}")
+            # Generate friendly feedback
+            feedback = self.model.invoke([
+                SystemMessage(content=f"""Generate warm feedback:
+Judgment: {evaluation.judgment}
+Correct: {evaluation.what_was_correct}
+Missing: {evaluation.what_was_missing}
 
-            # Determine the judgment
-            if "JUDGMENT: correct" in evaluation_text.lower():
-                judgment = "correct"
-            elif "JUDGMENT: partial" in evaluation_text.lower():
-                judgment = "partial"
-            else:
-                judgment = "incorrect"
+**Use markdown with emojis.**""")
+            ])
 
-            logger.info(f"Judgment: {judgment}, Attempts: {attempts}")
+            state["messages"].append(feedback)
 
-            # Update state based on judgment
-            if judgment == "correct":
+            # Update state based on evaluation
+            if evaluation.should_pass:
                 state["assessments_passed"] = state.get("assessments_passed", 0) + 1
-                state["current_assessment_question"] = None  # Clear for next topic
+                state["current_assessment_question"] = None
                 state["assessment_attempts"] = 0
 
-                # Update understanding level if doing well
-                assessments_passed = state["assessments_passed"]
-                if assessments_passed >= 3 and state["understanding_level"] == "beginner":
+                # Level up
+                passed = state["assessments_passed"]
+                if passed >= 3 and state["understanding_level"] == "beginner":
                     state["understanding_level"] = "intermediate"
-                    logger.info("Student promoted to intermediate level")
-                elif assessments_passed >= 6 and state["understanding_level"] == "intermediate":
+                elif passed >= 6 and state["understanding_level"] == "intermediate":
                     state["understanding_level"] = "advanced"
-                    logger.info("Student promoted to advanced level")
 
-                # Move to next stage
                 state["current_stage"] = "evaluation_complete"
 
-            elif judgment == "partial" and attempts < 2:
-                # Give them another chance with a hint
-                state["current_stage"] = "needs_hint"
-
-            elif attempts >= 2 or judgment == "incorrect":
-                # After 2 attempts or if completely incorrect, review the topic
+            elif evaluation.needs_review or attempts >= 2:
                 state["current_stage"] = "needs_review"
-                state["assessment_attempts"] = 0  # Reset counter to prevent infinite loop
-                state["current_assessment_question"] = None  # Clear question for fresh start
+                state["assessment_attempts"] = 0
+                state["current_assessment_question"] = None
+
             else:
-                # First incorrect attempt - give another try
                 state["current_stage"] = "needs_retry"
 
-            # Add the evaluation feedback to messages
-            state["messages"].append(AIMessage(content=evaluation_text))
-
-            logger.info(f"Evaluation complete - new stage: {state['current_stage']}")
             return state
 
         except Exception as e:
-            logger.error(f"Error in evaluate_answer_node: {str(e)}", exc_info=True)
-            friendly_message = get_stage_error_message("evaluation_complete")
-            state["messages"].append(AIMessage(content=friendly_message))
+            logger.error(f"Evaluation error: {e}")
+            state["messages"].append(AIMessage(content=get_stage_error_message("evaluation")))
             state["current_stage"] = "evaluation_complete"
-            raise Exception(friendly_message)
+            raise
 
     def question_answering_node(self, state: LearningState) -> LearningState:
-        """
-        Question answering node - handles student questions.
-
-        Raises:
-            Exception: If question answering fails
-        """
+        """Answer student questions."""
         try:
-            logger.info("Processing question answering node")
-
-            system_prompt = f"""You are a helpful biology teacher. A student has a question about {settings.COURSE_TOPIC}.
-
-                Answer their question:
-                1. Clearly and accurately
-                2. With relevant examples
-                3. Relate it back to what they've learned
-                4. Encourage further questions
-
-                Be patient and thorough.
-
-                **IMPORTANT: Format your answer in markdown with proper structure:**
-                - Use headings for different aspects of the answer
-                - Use **bold** for key concepts
-                - Use bullet points or numbered lists
-                - Use code blocks if needed
-                - Add emojis to make it engaging"""
-
-            user_question = state["messages"][-1].content if state["messages"] else "Can you help me understand this better?"
+            question = state["messages"][-1].content if state["messages"] else ""
 
             response = self.model.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_question)
+                SystemMessage(content=f"""Answer biology question clearly.
+Use examples and relate to {settings.COURSE_TOPIC}.
+**Use markdown: headings, bold, lists, emojis.**"""),
+                HumanMessage(content=question)
             ])
 
-            # Questions don't create new slides, answer stays with current topic slide
             state["messages"].append(response)
             state["questions_asked"] = state.get("questions_asked", 0) + 1
-            # Keep current_slide_index unchanged - no new slide for questions
 
-            logger.info("Question answering node completed successfully")
             return state
 
         except Exception as e:
-            logger.error(f"Error in question_answering_node: {str(e)}", exc_info=True)
-            friendly_message = get_stage_error_message("question_answering")
-            state["messages"].append(AIMessage(content=friendly_message))
-            raise Exception(friendly_message)
+            logger.error(f"Q&A error: {e}")
+            state["messages"].append(AIMessage(content=get_stage_error_message("question_answering")))
+            raise
 
-    # ========== HELPER FUNCTIONS ==========
+    # ========== HELPER METHODS ==========
 
     def _generate_slide(self, content: str, title: str, context: str, slide_number: int) -> dict:
-        """
-        Generate slide content from AI response.
-        """
+        """Generate slide with visual description."""
         try:
-            logger.debug(f"Generating slide {slide_number}: {title}")
+            slide_prompt = f"""Extract key points and visual description:
+Content: {content}
 
-            slide_prompt = f"""Based on this teaching content, create a visual slide description:
-
-    Content: {content}
-
-    Extract:
-    1. Key points (2-3 bullet points)
-    2. Visual description: Describe the diagram/illustration that should be shown
-    - What structures to show
-    - What colors to use
-    - Labels and annotations
-    - Spatial relationships
-
-    Format as JSON."""
+Return JSON: {{"key_points": ["point1", "point2"], "visual_description": "diagram description"}}"""
 
             try:
                 slide_response = self.model.invoke([SystemMessage(content=slide_prompt)])
-                visual_desc = slide_response.content
-            except Exception as e:
-                logger.warning(f"Failed to generate visual description, using fallback: {str(e)}")
-                visual_desc = "Illustration showing " + context
-
-            slide_data = {
-                "slide_number": slide_number,
-                "title": title or "Learning Slide",  # ADD THIS
-                "content": content[:300] if content else "Content not available",
-                "visual_description": visual_desc,
-                "full_content": content or "",  # ADD THIS
-                "topic": title or "Topic"  # ADD THIS
-            }
-
-            logger.debug(f"Slide {slide_number} generated successfully")
-            return slide_data
-
-        except Exception as e:
-            logger.error(f"Error generating slide: {str(e)}", exc_info=True)
-            return {
-                "slide_number": slide_number,
-                "title": title or "Learning Slide",
-                "content": content[:300] if content else "Content unavailable",
-                "visual_description": f"Illustration showing {context}",
-                "full_content": content or "",
-                "topic": title or "Topic"
-            }
-            
-    def _generate_slide(self, content: str, title: str, context: str, slide_number: int) -> dict:
-        """
-        Generate slide content with visual diagrams from AI response.
-        """
-        try:
-            logger.debug(f"Generating slide {slide_number}: {title}")
-
-            slide_prompt = f"""Based on this teaching content, create a visual slide description:
-
-    Content: {content}
-
-    Extract:
-    1. Key points (2-3 bullet points)
-    2. Visual description: Describe the diagram/illustration that should be shown
-    - What structures to show
-    - What colors to use
-    - Labels and annotations
-    - Spatial relationships
-
-    Format as JSON with keys: "key_points" (array) and "visual_description" (string)."""
-
-            try:
-                slide_response = self.model.invoke([SystemMessage(content=slide_prompt)])
-                
-                # Try to parse as JSON
-                import json
-                try:
-                    slide_json = json.loads(slide_response.content.strip())
-                    visual_desc = slide_json.get("visual_description", "")
-                    key_points = slide_json.get("key_points", [])
-                except json.JSONDecodeError:
-                    # Fallback to plain text
-                    visual_desc = slide_response.content
-                    key_points = []
-                    
-            except Exception as e:
-                logger.warning(f"Failed to generate visual description: {str(e)}")
-                visual_desc = "Illustration showing " + context
+                slide_json = json.loads(slide_response.content.strip())
+                visual_desc = slide_json.get("visual_description", f"Illustration of {context}")
+                key_points = slide_json.get("key_points", [])
+            except:
+                visual_desc = f"Illustration showing {context}"
                 key_points = []
 
-            # Generate actual visual diagram
-            from app.services.visual_generator import get_visual_generator
-            visual_gen = get_visual_generator()
-            visual_data = visual_gen.generate_visual(visual_desc, title, content)
-
-            slide_data = {
+            return {
                 "slide_number": slide_number,
                 "title": title or "Learning Slide",
-                "content": content[:300] if content else "Content not available",
+                "content": content[:300] if content else "Content unavailable",
                 "visual_description": visual_desc,
                 "full_content": content or "",
                 "topic": title or "Topic",
-                "key_points": key_points,
-                # NEW: Visual diagram data
-                "visual": {
-                    "type": visual_data["type"],  # "mermaid", "svg", "premade", "none"
-                    "data": visual_data["data"],
-                    "fallback_text": visual_data["fallback_text"]
-                }
+                "key_points": key_points
             }
 
-            logger.debug(f"Slide {slide_number} generated with visual type: {visual_data['type']}")
-            return slide_data
-
         except Exception as e:
-            logger.error(f"Error generating slide: {str(e)}", exc_info=True)
+            logger.error(f"Slide generation error: {e}")
             return {
                 "slide_number": slide_number,
                 "title": title or "Learning Slide",
@@ -864,29 +512,12 @@ FEEDBACK: [Your detailed feedback here]
                 "visual_description": f"Illustration showing {context}",
                 "full_content": content or "",
                 "topic": title or "Topic",
-                "key_points": [],
-                "visual": {
-                    "type": "none",
-                    "data": None,
-                    "fallback_text": f"Illustration showing {context}"
-                }
+                "key_points": []
             }
-        
+
     def initialize_state(self) -> LearningState:
-        """
-        Initialize a new learning state.
-
-        Returns:
-            New LearningState instance
-
-        Raises:
-            Exception: If state initialization fails
-        """
+        """Initialize new learning state."""
         try:
-            logger.info("Initializing new learning state")
-
-            logger.info("Initializing new learning state")
-
             state = LearningState(
                 messages=[],
                 current_stage="introduction",
@@ -900,13 +531,11 @@ FEEDBACK: [Your detailed feedback here]
                 assessment_attempts=0,
                 slides=[],
                 current_slide_index=0,
-                user_name=None,  # Not asked yet
-                learning_goal=None  # Not asked yet (empty string = asked but skipped)
+                user_name=None,
+                learning_goal=None
             )
-            print("completed")
-            logger.info("Learning state initialized successfully")
             return state
 
         except Exception as e:
-            logger.error(f"Error initializing learning state: {str(e)}", exc_info=True)
-            raise Exception(f"Failed to initialize learning state: {str(e)}")
+            logger.error(f"State initialization error: {e}")
+            raise
