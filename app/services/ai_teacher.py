@@ -42,7 +42,7 @@ class AITeacherService:
 
             logger.info(f"Streaming chat for thread_id: {thread_id}, message: {user_message[:50]}")
 
-            config = {"configurable": {"thread_id": thread_id}}
+            config = {"configurable": {"thread_id": thread_id, "recursion_limit": 50}}
 
             # Prepare input data
             if thread_id not in self.sessions:
@@ -209,7 +209,7 @@ class AITeacherService:
                 logger.info(f"Session not found for thread_id: {thread_id}")
                 return {}
 
-            config = {"configurable": {"thread_id": thread_id}}
+            config = {"configurable": {"thread_id": thread_id, "recursion_limit": 50}}
             try:
                 state = self.workflow.graph.get_state(config)
                 if not state or not state.values:
@@ -250,7 +250,7 @@ class AITeacherService:
                 logger.info(f"Session not found for thread_id: {thread_id}")
                 return []
 
-            config = {"configurable": {"thread_id": thread_id}}
+            config = {"configurable": {"thread_id": thread_id, "recursion_limit": 50}}
             try:
                 state = self.workflow.graph.get_state(config)
                 if not state or not state.values:
@@ -279,7 +279,7 @@ class AITeacherService:
                 logger.info(f"Session not found for thread_id: {thread_id}")
                 return None
 
-            config = {"configurable": {"thread_id": thread_id}}
+            config = {"configurable": {"thread_id": thread_id, "recursion_limit": 50}}
             try:
                 checkpoint = self.workflow.graph.get_state(config)
                 if not checkpoint or not checkpoint.values:

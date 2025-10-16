@@ -2,8 +2,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.api.routes import chat, websocket
+import logging
 
 settings = get_settings()
+
+# ---- Logging setup ----
+logging.basicConfig(
+    level=logging.INFO,  # Set to DEBUG if you want more details
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title=settings.PROJECT_NAME,

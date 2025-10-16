@@ -1,5 +1,5 @@
 """
-Simplified WebSocket route with token streaming.
+WebSocket route using proper LangGraph streaming modes.
 """
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.services.ai_teacher import get_teacher_service
@@ -9,63 +9,81 @@ import json
 import uuid
 import logging
 from datetime import datetime
+from starlette.websockets import WebSocketState
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
 def generate_id() -> str:
-    """Generate unique message ID."""
     return f"{datetime.utcnow().timestamp()}_{uuid.uuid4().hex[:6]}"
 
 
-async def send_json(ws: WebSocket, data: dict):
-    """Send JSON with auto-generated message ID."""
+async def send_json(ws: WebSocket, data: dict) -> bool:
+    """Send JSON safely, return False if connection closed."""
     try:
+        if ws.client_state != WebSocketState.CONNECTED:
+            return False
+            
         if "message_id" not in data:
             data["message_id"] = generate_id()
+            
         await ws.send_json(data)
-        logger.debug(f"Sent: {data.get('type', 'unknown')}")
-    except WebSocketDisconnect:
-        raise
+        return True
+    except (WebSocketDisconnect, RuntimeError):
+        return False
     except Exception as e:
         logger.warning(f"Send failed: {e}")
+        return False
 
 
 @router.websocket("/ws/chat/{thread_id}")
 async def websocket_chat(ws: WebSocket, thread_id: str):
-    """WebSocket endpoint for streaming chat."""
+    """WebSocket endpoint with proper LangGraph streaming."""
     await ws.accept()
     connection_id = generate_id()
     logger.info(f"Connected: {connection_id} (thread: {thread_id})")
 
     try:
         teacher_service = get_teacher_service()
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {"configurable": {"thread_id": thread_id, "recursion_limit": 50}}
 
-        # Check if this is a new session
+        # Check for new session
         is_new_session = thread_id not in teacher_service.sessions
         
         if is_new_session:
             logger.info(f"New session: {thread_id}")
-            # Check if state exists in checkpointer
             existing_state = teacher_service.workflow.graph.get_state(config)
             
             if not existing_state or not existing_state.values or not existing_state.values.get("slides"):
-                # Truly new session - trigger introduction
                 logger.info("Fresh session - starting introduction")
-                await handle_stream(ws, teacher_service, thread_id, "(start)", is_new=True)
+                await handle_stream(ws, teacher_service, thread_id, "", is_new=True)
             
             teacher_service.sessions.add(thread_id)
 
         # Main message loop
         while True:
-            raw = await ws.receive_text()
-            data = json.loads(raw)
+            if ws.client_state != WebSocketState.CONNECTED:
+                break
+                
+            try:
+                raw = await ws.receive_text()
+            except (WebSocketDisconnect, RuntimeError):
+                break
+                
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await send_json(ws, {"type": "error", "message": "Invalid JSON"})
+                continue
+                
             msg_type = data.get("type")
 
             if msg_type == "ping":
-                await send_json(ws, {"type": "pong", "timestamp": datetime.utcnow().isoformat()})
+                await send_json(ws, {
+                    "type": "pong", 
+                    "timestamp": datetime.utcnow().isoformat()
+                })
                 
             elif msg_type == "message":
                 content = data.get("content", "").strip()
@@ -73,25 +91,28 @@ async def websocket_chat(ws: WebSocket, thread_id: str):
                     await send_json(ws, {"type": "error", "message": "Empty message"})
                     continue
                     
-                await handle_stream(ws, teacher_service, thread_id, content, is_new=False)
+                stream_success = await handle_stream(
+                    ws, teacher_service, thread_id, content, is_new=False
+                )
                 
+                if not stream_success:
+                    break
+                    
             else:
-                await send_json(ws, {"type": "error", "message": f"Unknown type: {msg_type}"})
+                await send_json(ws, {
+                    "type": "error", 
+                    "message": f"Unknown type: {msg_type}"
+                })
 
     except WebSocketDisconnect:
-        logger.info(f"Disconnected: {connection_id}")
-    except json.JSONDecodeError:
-        logger.warning(f"Invalid JSON from {connection_id}")
-        await send_json(ws, {"type": "error", "message": "Invalid JSON"})
+        logger.info(f"Clean disconnect: {connection_id}")
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
-        try:
-            await send_json(ws, {"type": "error", "message": format_learner_error(e)})
-        except:
-            pass
+        await send_json(ws, {"type": "error", "message": format_learner_error(e)})
     finally:
         try:
-            await ws.close()
+            if ws.client_state == WebSocketState.CONNECTED:
+                await ws.close()
         except:
             pass
         logger.info(f"Cleaned up: {connection_id}")
@@ -103,131 +124,149 @@ async def handle_stream(
     thread_id: str, 
     message: str,
     is_new: bool = False
-):
+) -> bool:
     """
-    Handle streaming for a message.
+    Handle streaming using proper LangGraph stream modes.
     
-    Args:
-        ws: WebSocket connection
-        teacher_service: AI teacher service instance
-        thread_id: Thread ID for state persistence
-        message: User's message content
-        is_new: Whether this is a new session (needs state initialization)
+    Uses dual streaming:
+    - "messages" mode for LLM tokens
+    - "updates" mode for state changes (slides, stage, etc.)
     """
     try:
-        await send_json(ws, {"type": "stream_start", "message": "Meemo is thinking..."})
+        if not await send_json(ws, {
+            "type": "stream_start", 
+            "message": "Meemo is thinking..."
+        }):
+            return False
 
         config = {"configurable": {"thread_id": thread_id}}
 
-        # Prepare input data
+        # Prepare input
         if is_new:
-            # Initialize new session state
-            logger.info("Initializing new session state")
             initial_state = teacher_service.workflow.initialize_state()
-            initial_state["messages"].append(HumanMessage(content=message))
+            if message:  # Only add message if not empty
+                initial_state["messages"].append(HumanMessage(content=message))
             input_data = initial_state
         else:
-            # Existing session - just add new message
             input_data = {"messages": [HumanMessage(content=message)]}
 
-        # Track streaming state
-        accumulated = ""
+        # Track state
+        accumulated_content = ""
         current_stage = None
         current_slide = None
         seen_nodes = set()
 
-        # Stream with updates mode for incremental token delivery
-        async for chunk in teacher_service.workflow.graph.astream(
-            input_data, 
-            config=config, 
-            stream_mode="updates"
+        # ✨ Use multiple stream modes: messages + updates
+        async for stream_mode, chunk in teacher_service.workflow.graph.astream(
+            input_data,
+            config=config,
+            stream_mode=["messages", "updates"]  # Dual streaming!
         ):
-            for node_name, output in chunk.items():
-                if node_name == "__end__":
-                    continue
+            if ws.client_state != WebSocketState.CONNECTED:
+                return False
 
-                # Send node notification (only once per node)
-                if node_name not in seen_nodes:
-                    seen_nodes.add(node_name)
-                    await send_json(ws, {
-                        "type": "node_start",
-                        "node": node_name
-                    })
-
-                # Extract and stream tokens
-                if "messages" in output and output["messages"]:
-                    last_msg = output["messages"][-1]
+            # ========== MESSAGES MODE: LLM Tokens ==========
+            if stream_mode == "messages":
+                # chunk is a tuple: (message_chunk, metadata)
+                message_chunk, metadata = chunk
+                
+                # Extract token from message chunk
+                if hasattr(message_chunk, "content") and message_chunk.content:
+                    token = message_chunk.content
+                    accumulated_content += token
                     
-                    if hasattr(last_msg, "type") and last_msg.type == "ai":
-                        content = last_msg.content
-                        
-                        # Calculate delta (new tokens)
-                        if len(content) > len(accumulated):
-                            delta = content[len(accumulated):]
-                            accumulated = content
-                            
-                            # Stream the delta
-                            await send_json(ws, {
-                                "type": "token",
-                                "content": delta,
-                                "node": node_name
-                            })
+                    # Stream token to client
+                    if not await send_json(ws, {
+                        "type": "token",
+                        "content": token,
+                        "metadata": {
+                            "node": metadata.get("langgraph_node"),
+                            "step": metadata.get("langgraph_step")
+                        }
+                    }):
+                        return False
 
-                # Track stage changes
-                if "current_stage" in output:
-                    new_stage = output["current_stage"]
-                    if new_stage != current_stage:
-                        current_stage = new_stage
-                        await send_json(ws, {
-                            "type": "stage_change",
-                            "stage": current_stage,
+            # ========== UPDATES MODE: State Changes ==========
+            elif stream_mode == "updates":
+                # chunk is a dict: {node_name: node_output}
+                for node_name, node_output in chunk.items():
+                    if node_name == "__end__":
+                        continue
+
+                    # Notify about node execution
+                    if node_name not in seen_nodes:
+                        seen_nodes.add(node_name)
+                        if not await send_json(ws, {
+                            "type": "node_start",
                             "node": node_name
-                        })
+                        }):
+                            return False
 
-                # Track slide updates
-                if "slides" in output:
-                    slides = output["slides"]
-                    slide_idx = output.get("current_slide_index", len(slides) - 1)
-                    
-                    if slides and slide_idx < len(slides):
-                        slide_data = slides[slide_idx]
+                    # Check for stage changes
+                    if "current_stage" in node_output:
+                        new_stage = node_output["current_stage"]
+                        if new_stage != current_stage:
+                            current_stage = new_stage
+                            if not await send_json(ws, {
+                                "type": "stage_change",
+                                "stage": current_stage,
+                                "node": node_name
+                            }):
+                                return False
+
+                    # Check for slide updates
+                    if "slides" in node_output:
+                        slides = node_output["slides"]
+                        slide_idx = node_output.get("current_slide_index", len(slides) - 1)
                         
-                        # Only send if it's a new slide
-                        if current_slide is None or current_slide.get("slide_number") != slide_data.get("slide_number"):
-                            current_slide = slide_data
-                            await send_json(ws, {
-                                "type": "slide",
-                                "slide": slide_data,
-                                "slide_index": slide_idx,
-                                "total_slides": len(slides)
-                            })
+                        if slides and slide_idx < len(slides):
+                            slide_data = slides[slide_idx]
+                            
+                            # Only send new slides
+                            if (current_slide is None or 
+                                current_slide.get("slide_number") != slide_data.get("slide_number")):
+                                current_slide = slide_data
+                                if not await send_json(ws, {
+                                    "type": "slide",
+                                    "slide": slide_data,
+                                    "slide_index": slide_idx,
+                                    "total_slides": len(slides)
+                                }):
+                                    return False
 
-        # Get final state for completion info
+        # Get final state
         final_state = teacher_service.workflow.graph.get_state(config)
         result = final_state.values if final_state else {}
 
-        # Send final response
-        await send_final(ws, result, accumulated)
-        await send_json(ws, {"type": "stream_end"})
+        # Send completion
+        if not await send_final(ws, result, accumulated_content):
+            return False
+            
+        if not await send_json(ws, {"type": "stream_end"}):
+            return False
 
-        logger.info(f"Stream completed: {len(accumulated)} characters")
+        logger.info(f"✅ Stream completed: {len(accumulated_content)} chars")
+        return True
 
+    except WebSocketDisconnect:
+        logger.info("Client disconnected during stream")
+        return False
     except Exception as e:
-        logger.error(f"Error in handle_stream: {e}", exc_info=True)
+        logger.error(f"❌ Error in handle_stream: {e}", exc_info=True)
         await send_json(ws, {
             "type": "error",
-            "message": format_learner_error(e),
-            "technical_details": str(e) if logger.level <= logging.DEBUG else None
+            "message": format_learner_error(e)
         })
+        return False
 
 
-async def send_final(ws: WebSocket, result: dict, message: str):
-    """Send final completion message with full state."""
+async def send_final(ws: WebSocket, result: dict, message: str) -> bool:
+    """Send final completion message."""
     slides = result.get("slides", [])
     idx = result.get("current_slide_index", 0)
     slide = slides[idx] if slides and idx < len(slides) else None
 
-    await send_json(ws, {
+    return await send_json(ws, {
         "type": "response_complete",
         "message": message,
         "slide": slide,
